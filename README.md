@@ -3,9 +3,6 @@ import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:video_player/video_player.dart';
-import 'package:chewie/chewie.dart';
-import 'package:flutter/foundation.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
@@ -14,12 +11,10 @@ import 'dart:async';
 import 'dart:isolate';
 import 'package:http/http.dart' as http;
 
-// ═══════════════════════════════════════════════════════════════════
-// CHANNEL
-// ═══════════════════════════════════════════════════════════════════
 const _svcChannel = MethodChannel(
   'com.example.wiespl_contrl_panel/recording_service',
 );
+const _fileChannel = MethodChannel('com.example.wiespl_contrl_panel/file_open');
 
 Future<void> _startForegroundService() async {
   try {
@@ -37,9 +32,22 @@ Future<void> _stopForegroundService() async {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// ISOLATE MESSAGES
-// ═══════════════════════════════════════════════════════════════════
+Future<void> _openInExternalPlayer(
+  BuildContext context,
+  String filePath,
+) async {
+  try {
+    await _fileChannel.invokeMethod('openVideo', {'path': filePath});
+  } catch (e) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Cannot open file: $e')));
+    }
+    debugPrint('openVideo error: $e');
+  }
+}
+
 class _Msg {
   final String type;
   final dynamic data;
@@ -54,10 +62,6 @@ class _Config {
   const _Config(this.streamUrl, this.tcpPort, this.tx, this.is4K);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// MULTIPART MJPEG PARSER
-// Uses Content-Length header — reads exact bytes per frame.
-// ═══════════════════════════════════════════════════════════════════
 enum _ParseState { header, body, crlf }
 
 class _MjpegParser {
@@ -88,7 +92,6 @@ class _MjpegParser {
             if (_contentLength > 0) _state = _ParseState.body;
           }
           break;
-
         case _ParseState.body:
           final needed = _contentLength - _bodyBuf.length;
           final available = bytes.length - i;
@@ -103,7 +106,6 @@ class _MjpegParser {
             _state = _ParseState.crlf;
           }
           break;
-
         case _ParseState.crlf:
           final b = bytes[i++];
           if (b == 0x0D || b == 0x0A) {
@@ -121,9 +123,8 @@ class _MjpegParser {
 
   int _parseContentLength(String headers) {
     for (final line in headers.split('\r\n')) {
-      if (line.toLowerCase().startsWith('content-length:')) {
+      if (line.toLowerCase().startsWith('content-length:'))
         return int.tryParse(line.substring(15).trim()) ?? 0;
-      }
     }
     return 0;
   }
@@ -137,16 +138,10 @@ class _MjpegParser {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// ISOLATE
-// Sends TCP FIN (not RST) on stop for clean FFmpeg shutdown.
-// ═══════════════════════════════════════════════════════════════════
 void _isolateMain(List<dynamic> args) async {
   final cfg = args[0] as _Config;
-
   final rx = ReceivePort();
   cfg.tx.send(_Msg('ready', rx.sendPort));
-
   bool stop = false;
   rx.listen((_) {
     stop = true;
@@ -172,21 +167,19 @@ void _isolateMain(List<dynamic> args) async {
         await Future.delayed(const Duration(milliseconds: 400));
       }
     }
-
     if (sock == null || stop) {
       cfg.tx.send(_Msg('done', null));
       return;
     }
-
     cfg.tx.send(_Msg('info', 'TCP connected to FFmpeg'));
 
     if (cfg.is4K) {
-      // ── 4K: parse complete frames, send with back-pressure ─────
       final parser = _MjpegParser();
       int sentFrames = 0;
-
       DateTime lastFrameTime = DateTime.now();
       bool forceReconnect = false;
+      bool sockDead = false;
+
       final watchdog = Timer.periodic(const Duration(seconds: 5), (_) {
         if (stop) return;
         final age = DateTime.now().difference(lastFrameTime).inSeconds;
@@ -196,12 +189,6 @@ void _isolateMain(List<dynamic> args) async {
         }
       });
 
-      // sockDead = true when the TCP socket to FFmpeg is broken.
-      // This is FATAL — we cannot send more frames, stop everything.
-      // It is separate from HTTP stream ending (which is normal and
-      // should trigger a reconnect to mjpg_streamer, not a full stop).
-      bool sockDead = false;
-
       while (!stop && !sockDead) {
         forceReconnect = false;
         http.Client? client;
@@ -210,11 +197,9 @@ void _isolateMain(List<dynamic> args) async {
           final req = http.Request('GET', Uri.parse(cfg.streamUrl));
           req.headers['Connection'] = 'keep-alive';
           req.headers['Cache-Control'] = 'no-cache';
-
           final resp = await client
               .send(req)
               .timeout(const Duration(seconds: 8));
-
           await for (final chunk in resp.stream.timeout(
             const Duration(seconds: 5),
           )) {
@@ -227,20 +212,16 @@ void _isolateMain(List<dynamic> args) async {
                 await sock!.addStream(Stream.value(frame));
                 sentFrames++;
                 totalBytes += frame.length;
-                if (totalBytes % (512 * 1024) < frame.length) {
+                if (totalBytes % (512 * 1024) < frame.length)
                   cfg.tx.send(_Msg('bytes', totalBytes));
-                }
               } catch (e) {
-                // TCP socket to FFmpeg is dead — cannot continue
                 sockDead = true;
                 cfg.tx.send(_Msg('info', 'TCP error: $e'));
                 break;
               }
             }
           }
-
           if (stop || sockDead) break;
-          // HTTP stream ended normally — reconnect to mjpg_streamer
           parser.reset();
           reconnects++;
           cfg.tx.send(_Msg('info', 'HTTP reconnect #$reconnects'));
@@ -265,17 +246,15 @@ void _isolateMain(List<dynamic> args) async {
         }
         if (stop || sockDead) break;
         if (reconnects > 50) {
-          cfg.tx.send(_Msg('info', 'Too many reconnects — stopping'));
+          cfg.tx.send(_Msg('info', 'Too many reconnects'));
           break;
         }
       }
-
       watchdog.cancel();
       cfg.tx.send(
         _Msg('info', '4K done — sent:$sentFrames reconnects:$reconnects'),
       );
     } else {
-      // ── HD/FHD/QHD: raw chunk back-pressure ───────────────────
       while (!stop) {
         http.Client? client;
         try {
@@ -283,11 +262,9 @@ void _isolateMain(List<dynamic> args) async {
           final req = http.Request('GET', Uri.parse(cfg.streamUrl));
           req.headers['Connection'] = 'keep-alive';
           req.headers['Cache-Control'] = 'no-cache';
-
           final resp = await client
               .send(req)
               .timeout(const Duration(seconds: 15));
-
           await for (final chunk in resp.stream) {
             if (stop) break;
             try {
@@ -296,11 +273,9 @@ void _isolateMain(List<dynamic> args) async {
               break;
             }
             totalBytes += chunk.length;
-            if (totalBytes % (256 * 1024) < chunk.length) {
+            if (totalBytes % (256 * 1024) < chunk.length)
               cfg.tx.send(_Msg('bytes', totalBytes));
-            }
           }
-
           if (stop) break;
           reconnects++;
           cfg.tx.send(_Msg('info', 'Reconnecting… ($reconnects)'));
@@ -321,9 +296,6 @@ void _isolateMain(List<dynamic> args) async {
   } catch (e) {
     debugPrint('Isolate error: $e');
   } finally {
-    // GRACEFUL CLOSE: TCP FIN tells FFmpeg "input done, seal the file"
-    // close() = FIN = clean EOF. destroy() = RST = broken connection.
-    // FFmpeg writes moov atom immediately on FIN, in <1s.
     try {
       await sock?.close();
     } catch (_) {
@@ -335,7 +307,6 @@ void _isolateMain(List<dynamic> args) async {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════
 void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
@@ -349,53 +320,6 @@ class MyApp extends StatelessWidget {
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// OPEN FILE IN EXTERNAL APP
-//
-// Uses a MethodChannel to fire an Android ACTION_VIEW intent with a
-// FileProvider URI. This is the correct way to open local files in
-// external apps (MX Player, VLC, etc.) on Android 7+.
-// Plain file:// URIs are blocked by Android since API 24.
-//
-// Requires in AndroidManifest.xml:
-//   <provider
-//     android:name="androidx.core.content.FileProvider"
-//     android:authorities="${applicationId}.fileprovider"
-//     android:exported="false"
-//     android:grantUriPermissions="true">
-//     <meta-data
-//       android:name="android.support.FILE_PROVIDER_PATHS"
-//       android:resource="@xml/file_paths" />
-//   </provider>
-//
-// Requires res/xml/file_paths.xml:
-//   <paths>
-//     <external-files-path name="recordings" path="Recordings/" />
-//     <cache-path name="cache" path="." />
-//   </paths>
-// ═══════════════════════════════════════════════════════════════════
-const _fileChannel = MethodChannel('com.example.wiespl_contrl_panel/file_open');
-
-Future<void> _openInExternalPlayer(
-  BuildContext context,
-  String filePath,
-) async {
-  try {
-    await _fileChannel.invokeMethod('openVideo', {'path': filePath});
-  } catch (e) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Cannot open file: $e')));
-    }
-    debugPrint('openVideo error: $e');
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// MAIN PAGE
-
-// ═══════════════════════════════════════════════════════════════════
 class StreamRecorderPage extends StatefulWidget {
   const StreamRecorderPage({Key? key}) : super(key: key);
   @override
@@ -406,23 +330,18 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
     with WidgetsBindingObserver {
   late WebViewController _wvc;
   bool _loading = true;
-
   bool _recording = false;
   bool _finalising = false;
   String _status = '';
   String _infoMsg = '';
-
   Isolate? _iso;
   ReceivePort? _rx;
   SendPort? _tx;
   Completer<void>? _isoDone;
-
   FFmpegSession? _ffSession;
   Completer<void>? _ffDone;
   String? _outputPath;
-
   static const _tcpPort = 18888;
-
   int _bytes = 0;
   DateTime? _startTime;
   Timer? _uiTimer;
@@ -485,7 +404,7 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
   }
 
   Map<String, dynamic> _profile(int w) {
-    if (w >= 3840) {
+    if (w >= 3840)
       return {
         'fps': 10,
         'probeSize': 2000000,
@@ -495,7 +414,7 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
         'threads': 2,
         'is4K': true,
       };
-    } else if (w >= 2560) {
+    if (w >= 2560)
       return {
         'fps': 15,
         'probeSize': 5000000,
@@ -505,7 +424,7 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
         'threads': 2,
         'is4K': false,
       };
-    } else if (w >= 1920) {
+    if (w >= 1920)
       return {
         'fps': 25,
         'probeSize': 5000000,
@@ -515,46 +434,20 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
         'threads': 2,
         'is4K': false,
       };
-    } else {
-      return {
-        'fps': 25,
-        'probeSize': 20000000,
-        'analyzeDur': 20000000,
-        'preset': 'ultrafast',
-        'crf': 23,
-        'threads': 0,
-        'is4K': false,
-      };
-    }
+    return {
+      'fps': 25,
+      'probeSize': 20000000,
+      'analyzeDur': 20000000,
+      'preset': 'ultrafast',
+      'crf': 23,
+      'threads': 0,
+      'is4K': false,
+    };
   }
 
-  // ════════════════════════════════════════════════════════════════
-  // FFmpeg command
-  //
-  // WHY +faststart FAILED on Android:
-  //   +faststart requires FFmpeg to seek back to position 0 in the
-  //   output file to prepend the moov atom after writing all data.
-  //   Android external storage (scoped storage / SAF) often does NOT
-  //   support seeking on files opened by path — the seek silently
-  //   fails, leaving the file with video data but no moov atom.
-  //   Result: file exists, has size, but cannot be played.
-  //
-  // THE CORRECT SOLUTION for Android — two-pass write to app cache:
-  //   1. FFmpeg writes the file to app internal cache directory
-  //      (getApplicationDocumentsDirectory or getCacheDir).
-  //      Internal storage ALWAYS supports seeking — moov write works.
-  //   2. After FFmpeg finishes, we copy the file to external storage
-  //      using Dart File.copy() which works on all Android versions.
-  //
-  // WHY NOT fragmented MP4 (+frag_keyframe+empty_moov):
-  //   Fragmented MP4 needs keyframes to close fragments. Short 4K
-  //   recordings (30s, low fps) may have very few keyframes. If the
-  //   last fragment is incomplete at stop time, the file is unplayable.
-  //   Standard MP4 with internal-storage write is always reliable.
-  //
-  // MOVFLAGS used: +faststart (works on internal storage) +write_colr
-  //   These produce a standard, widely-compatible MP4.
-  // ════════════════════════════════════════════════════════════════
+  // Fragmented MP4: no file seek needed → works on external storage.
+  // File is sealed instantly on TCP FIN regardless of size.
+  // No temp file, no copy → 20-min 4K saves in <1 second.
   String _buildFfmpegCmd(int w, int h, String outputPath) {
     final p = _profile(w);
     final fps = p['fps'] as int;
@@ -562,50 +455,27 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
         ? '-threads ${p['threads']} '
         : '';
     final vf = 'fps=$fps,scale=${w}:${h}';
-
-    // -r before -i sets the INPUT frame rate for MJPEG demuxer.
-    // -framerate is NOT valid for ffmpeg-kit — use -r on input side.
-    // -vf fps= resamples output to exact fps regardless of input rate.
-    // No -movflags tricks needed when writing to internal cache storage.
     return '-y '
-        '-analyzeduration ${p['analyzeDur']} '
-        '-probesize ${p['probeSize']} '
-        '-r $fps '
-        '-f mjpeg '
+        '-analyzeduration ${p['analyzeDur']} -probesize ${p['probeSize']} '
+        '-r $fps -f mjpeg '
         '-i "tcp://127.0.0.1:$_tcpPort?listen=1&timeout=60000000" '
         '$threadFlag'
-        '-vf "$vf" '
-        '-c:v libx264 '
-        '-preset ${p['preset']} '
-        '-tune zerolatency '
-        '-crf ${p['crf']} '
-        '-pix_fmt yuv420p '
-        '-r $fps '
-        '-an '
+        '-vf "$vf" -c:v libx264 -preset ${p['preset']} -tune zerolatency '
+        '-crf ${p['crf']} -pix_fmt yuv420p -r $fps -an '
+        '-movflags +frag_keyframe+default_base_moof '
         '-avoid_negative_ts make_zero '
         '"$outputPath"';
   }
 
-  // ════════════════════════════════════════════════════════════════
-  // START
-  // Write to internal cache first, copy to external after save.
-  // ════════════════════════════════════════════════════════════════
   Future<void> _startRecording() async {
     try {
       await _startForegroundService();
-
-      // Internal cache dir — always supports file seeking (needed for
-      // +faststart moov write). External storage does NOT support seek.
-      final cacheDir = await getTemporaryDirectory();
       final ts = DateTime.now().millisecondsSinceEpoch;
       final res = _resolutions[_selRes]!;
       final w = res['w']!;
       final h = res['h']!;
 
-      // Temp file in internal cache for FFmpeg to write
-      final tempPath = '${cacheDir.path}/rec_tmp_$ts.mp4';
-
-      // Final destination on external storage
+      // Write directly to external storage — no temp file, no copy.
       final extDir = Platform.isAndroid
           ? await getExternalStorageDirectory()
           : await getApplicationDocumentsDirectory();
@@ -620,50 +490,27 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
       _isoDone = Completer<void>();
       _ffDone = Completer<void>();
 
-      final cmd = _buildFfmpegCmd(w, h, tempPath);
+      final cmd = _buildFfmpegCmd(w, h, _outputPath!);
       debugPrint('FFmpeg cmd: $cmd');
 
       _ffSession = await FFmpegKit.executeAsync(cmd, (session) async {
         final rc = await session.getReturnCode();
-        // getLogs() collects all FFmpeg stderr output
         final logs = await session.getLogs();
-        final logText = logs.map((l) => l.getMessage()).join('\n');
         debugPrint('══ FFmpeg RC: $rc ══');
-        debugPrint('══ FFmpeg logs ══\n$logText');
-
+        debugPrint(logs.map((l) => l.getMessage()).join('\n'));
         try {
           if (!(_ffDone?.isCompleted ?? true)) _ffDone!.complete();
         } catch (_) {}
-
         await _stopForegroundService();
         if (!mounted) return;
-
         if (ReturnCode.isSuccess(rc)) {
-          try {
-            final tmpFile = File(tempPath);
-            final sz = await tmpFile.length();
-            debugPrint('Temp file size: $sz bytes');
-            if (sz > 0) {
-              await tmpFile.copy(_outputPath!);
-              await tmpFile.delete();
-              _show('Saved ✓  ${_outputPath!.split('/').last}');
-            } else {
-              _show('Error: encoded file is empty');
-            }
-          } catch (e) {
-            _show('Save failed: $e');
-            debugPrint('Copy error: $e');
-          }
+          _show('Saved ✓  ${_outputPath!.split('/').last}');
         } else {
-          try {
-            await File(tempPath).delete();
-          } catch (_) {}
           _show('Encoding failed (RC: $rc) — see logcat');
         }
       });
 
       await Future.delayed(const Duration(seconds: 2));
-
       final profile = _profile(w);
 
       _rx = ReceivePort();
@@ -703,7 +550,6 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
       _bytes = 0;
       _startTime = DateTime.now();
       if (mounted) setState(() => _recording = true);
-
       _uiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         if (mounted) setState(() {});
       });
@@ -714,9 +560,6 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
     }
   }
 
-  // ════════════════════════════════════════════════════════════════
-  // STOP — clean EOF sequence
-  // ════════════════════════════════════════════════════════════════
   Future<void> _stopRecording() async {
     if (!_recording) return;
     _uiTimer?.cancel();
@@ -727,11 +570,8 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
         _status = 'Stopping…';
       });
 
-    // Ask isolate to close socket cleanly (TCP FIN → FFmpeg EOF)
     _tx?.send('stop');
     _tx = null;
-
-    // Wait for isolate to confirm socket closed
     _setStatus('Closing stream…');
     try {
       await _isoDone?.future.timeout(
@@ -740,24 +580,23 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
       );
     } catch (_) {}
 
-    // Hard-kill isolate (safety net)
     _iso?.kill(priority: Isolate.immediate);
     _iso = null;
     _rx?.close();
     _rx = null;
 
-    // Wait for FFmpeg to write moov and copy file to external storage
-    _setStatus('Saving MP4…');
+    // Fragmented MP4 seals in <1s on clean TCP FIN — timeout is just a safety net.
+    _setStatus('Saving…');
     try {
       await _ffDone?.future.timeout(
-        const Duration(seconds: 60),
+        const Duration(seconds: 15),
         onTimeout: () {
-          debugPrint('FFmpeg seal timeout — cancelling');
+          debugPrint('FFmpeg seal timeout');
           _ffSession?.cancel();
         },
       );
     } catch (e) {
-      debugPrint('FFmpeg wait error: $e');
+      debugPrint('FFmpeg wait: $e');
     }
 
     if (mounted) setState(() => _finalising = false);
@@ -1015,9 +854,6 @@ class _StreamRecorderPageState extends State<StreamRecorderPage>
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// BLINKING DOT
-// ═══════════════════════════════════════════════════════════════════
 class _Blink extends StatefulWidget {
   @override
   State<_Blink> createState() => _BlinkState();
@@ -1028,7 +864,6 @@ class _BlinkState extends State<_Blink> with SingleTickerProviderStateMixin {
     vsync: this,
     duration: const Duration(milliseconds: 800),
   )..repeat(reverse: true);
-
   @override
   void dispose() {
     _c.dispose();
@@ -1050,5 +885,996 @@ class _BlinkState extends State<_Blink> with SingleTickerProviderStateMixin {
 }
 
 
-#   o r _ a p p  
- 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'dart:async';
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'HDMI Control',
+      theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
+      home: const HDMIControlPage(),
+      debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+class HDMIControlPage extends StatefulWidget {
+  const HDMIControlPage({super.key});
+
+  @override
+  State<HDMIControlPage> createState() => _HDMIControlPageState();
+}
+
+class _HDMIControlPageState extends State<HDMIControlPage> {
+  String _statusMessage = '';
+  bool _isLoading = false;
+
+  // Camera URLs for HDMI 1
+  final Map<String, String> hdmi1Cameras = {
+    'Camera 1': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9081',
+    'Camera 2': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9082',
+    'Camera 3': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9083',
+    'Camera 4': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9084',
+  };
+
+  // Camera URLs for HDMI 2
+  final Map<String, String> hdmi2Cameras = {
+    'Camera 1': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9081',
+    'Camera 2': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9082',
+    'Camera 3': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9083',
+    'Camera 4': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9084',
+  };
+
+  Future<void> _switchCamera(String cameraName, String url) async {
+    setState(() {
+      _isLoading = true;
+      _statusMessage = 'Switching to $cameraName...';
+    });
+
+    try {
+      final uri = Uri.parse(url);
+      final response = await http.get(uri).timeout(const Duration(seconds: 5));
+
+      setState(() {
+        if (response.statusCode == 200) {
+          _statusMessage = '✓ Successfully switched to $cameraName';
+          _showSnackBar('$cameraName activated', isSuccess: true);
+        } else {
+          _statusMessage = '✗ Failed with status: ${response.statusCode}';
+          _showSnackBar('Error: ${response.statusCode}', isSuccess: false);
+        }
+      });
+    } catch (e) {
+      setState(() {
+        _statusMessage = '✗ Error: Could not connect';
+      });
+      _showSnackBar('Connection failed', isSuccess: false);
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  void _showSnackBar(String message, {required bool isSuccess}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isSuccess ? Colors.green : Colors.red,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _showHDMIPopup(String hdmiNumber, Map<String, String> cameras) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Row(
+            children: [
+              Icon(
+                hdmiNumber == '1' ? Icons.tv : Icons.live_tv,
+                color: hdmiNumber == '1' ? Colors.blue : Colors.green,
+              ),
+              const SizedBox(width: 10),
+              Text('HDMI $hdmiNumber Cameras'),
+            ],
+          ),
+          content: Container(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: cameras.length,
+              itemBuilder: (context, index) {
+                String cameraName = cameras.keys.elementAt(index);
+                String cameraUrl = cameras.values.elementAt(index);
+
+                return Card(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  child: ListTile(
+                    leading: CircleAvatar(
+                      backgroundColor: hdmiNumber == '1'
+                          ? Colors.blue
+                          : Colors.green,
+                      child: Text('${index + 1}'),
+                    ),
+                    title: Text(
+                      cameraName,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    subtitle: Text(
+                      cameraUrl,
+                      style: const TextStyle(fontSize: 12),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: ElevatedButton(
+                      onPressed: _isLoading
+                          ? null
+                          : () {
+                              Navigator.pop(context);
+                              _switchCamera(cameraName, cameraUrl);
+                            },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: hdmiNumber == '1'
+                            ? Colors.blue
+                            : Colors.green,
+                        foregroundColor: Colors.white,
+                      ),
+                      child: const Text('Select'),
+                    ),
+                    onTap: () {
+                      Navigator.pop(context);
+                      _switchCamera(cameraName, cameraUrl);
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text(
+          'HDMI Camera Controller',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        centerTitle: true,
+        backgroundColor: Colors.blue,
+        foregroundColor: Colors.white,
+      ),
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.blue.shade50, Colors.white],
+          ),
+        ),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(20.0),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                // Status Message
+                if (_statusMessage.isNotEmpty)
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    margin: const EdgeInsets.only(bottom: 30),
+                    decoration: BoxDecoration(
+                      color: _statusMessage.startsWith('✓')
+                          ? Colors.green.shade100
+                          : (_statusMessage.startsWith('✗')
+                                ? Colors.red.shade100
+                                : Colors.blue.shade100),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: _statusMessage.startsWith('✓')
+                            ? Colors.green
+                            : (_statusMessage.startsWith('✗')
+                                  ? Colors.red
+                                  : Colors.blue),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _statusMessage.startsWith('✓')
+                              ? Icons.check_circle
+                              : (_statusMessage.startsWith('✗')
+                                    ? Icons.error
+                                    : Icons.info),
+                          color: _statusMessage.startsWith('✓')
+                              ? Colors.green
+                              : (_statusMessage.startsWith('✗')
+                                    ? Colors.red
+                                    : Colors.blue),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            _statusMessage,
+                            style: const TextStyle(fontSize: 16),
+                          ),
+                        ),
+                        if (_isLoading)
+                          const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                      ],
+                    ),
+                  ),
+
+                // HDMI Buttons
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // HDMI 1 Button
+                    Expanded(
+                      child: _buildHDMIButton(
+                        number: '1',
+                        color: Colors.blue,
+                        icon: Icons.tv,
+                        onTap: () => _showHDMIPopup('1', hdmi1Cameras),
+                      ),
+                    ),
+                    const SizedBox(width: 20),
+                    // HDMI 2 Button
+                    Expanded(
+                      child: _buildHDMIButton(
+                        number: '2',
+                        color: Colors.green,
+                        icon: Icons.live_tv,
+                        onTap: () => _showHDMIPopup('2', hdmi2Cameras),
+                      ),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 40),
+
+                // Info Text
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.grey.shade200,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Column(
+                    children: [
+                      const Icon(Icons.info_outline, color: Colors.blue),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Click on HDMI 1 or HDMI 2 to select a camera',
+                        style: TextStyle(color: Colors.grey.shade700),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHDMIButton({
+    required String number,
+    required Color color,
+    required IconData icon,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: _isLoading ? null : onTap,
+      child: Container(
+        height: 200,
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [color, color.withOpacity(0.7)],
+          ),
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: [
+            BoxShadow(
+              color: color.withOpacity(0.3),
+              blurRadius: 10,
+              offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(20),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon, size: 80, color: Colors.white),
+                const SizedBox(height: 10),
+                Text(
+                  'HDMI $number',
+                  style: const TextStyle(
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 4,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.3),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    '${number == '1' ? '4' : '4'} Cameras',
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+
+void main() => runApp(const MyApp());
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'TinyCam Controller',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData.dark(),
+      home: const TinyCamPage(),
+    );
+  }
+}
+
+class TinyCamPage extends StatefulWidget {
+  const TinyCamPage({super.key});
+  @override
+  State<TinyCamPage> createState() => _TinyCamPageState();
+}
+
+class _TinyCamPageState extends State<TinyCamPage> {
+  // ── Config — change these if needed ─────────────────────
+  final String host = '192.168.1.143';
+  final int port = 8083;
+  final String username = 'admin';
+  final String password = ''; // leave empty if no password set
+
+  // ── State ────────────────────────────────────────────────
+  String? _token; // auth token from login
+  bool _loggedIn = false;
+  bool _recording = false;
+  bool _loading = false;
+  final List<String> _logs = [];
+
+  String get base => 'http://$host:$port';
+
+  // ── Logging ──────────────────────────────────────────────
+  void _log(String msg) {
+    final now = DateTime.now();
+    final t =
+        '${now.hour.toString().padLeft(2, '0')}:'
+        '${now.minute.toString().padLeft(2, '0')}:'
+        '${now.second.toString().padLeft(2, '0')}';
+    setState(() {
+      _logs.insert(0, '[$t] $msg');
+      if (_logs.length > 100) _logs.removeLast();
+    });
+  }
+
+  // ── Step 1: Login → get token ────────────────────────────
+  // Official TinyCam API: POST /api/v1/login  (or GET with Basic Auth)
+  Future<bool> _login() async {
+    setState(() => _loading = true);
+    _log('🔑 Logging in as "$username"...');
+
+    try {
+      // TinyCam supports Basic Auth on every request OR token-based login
+      // Try token login first
+      final uri = Uri.parse('$base/api/v1/login');
+      final res = await http
+          .post(
+            uri,
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'username': username, 'password': password}),
+          )
+          .timeout(const Duration(seconds: 6));
+
+      _log('Login response ${res.statusCode}: ${res.body}');
+
+      if (res.statusCode == 200) {
+        try {
+          final data = jsonDecode(res.body);
+          _token = data['data']?['token'] ?? data['token'];
+          if (_token != null) {
+            _log('✅ Logged in! Token: ${_token!.substring(0, 8)}...');
+            setState(() {
+              _loggedIn = true;
+              _loading = false;
+            });
+            return true;
+          }
+        } catch (_) {}
+      }
+
+      // Fallback: use HTTP Basic Auth (no token needed, just attach header each time)
+      _log('ℹ️ Using Basic Auth instead of token');
+      setState(() {
+        _loggedIn = true;
+        _loading = false;
+      });
+      return true;
+    } catch (e) {
+      _log('❌ Login failed: $e');
+      setState(() {
+        _loggedIn = false;
+        _loading = false;
+      });
+      return false;
+    }
+  }
+
+  // ── Build auth headers ───────────────────────────────────
+  Map<String, String> get _authHeaders {
+    if (_token != null) {
+      // Token-based (preferred by TinyCam API)
+      return {'token': _token!};
+    }
+    // HTTP Basic Auth fallback
+    if (username.isNotEmpty) {
+      final encoded = base64Encode(utf8.encode('$username:$password'));
+      return {'Authorization': 'Basic $encoded'};
+    }
+    return {};
+  }
+
+  // ── GET helper ───────────────────────────────────────────
+  Future<http.Response?> _get(String path) async {
+    try {
+      final res = await http
+          .get(Uri.parse('$base$path'), headers: _authHeaders)
+          .timeout(const Duration(seconds: 6));
+      _log('→ GET $path  ←  ${res.statusCode}: ${res.body}');
+      return res;
+    } catch (e) {
+      _log('❌ $path failed: $e');
+      return null;
+    }
+  }
+
+  // ── Start Recording ──────────────────────────────────────
+  // TinyCam API: param.cgi?action=update&root.BackgroundMode=on
+  // This starts background mode which includes recording
+  Future<void> _startRecording() async {
+    if (!_loggedIn) {
+      await _login();
+    }
+    setState(() => _loading = true);
+    _log('▶ Starting recording...');
+
+    // Try official TinyCam API endpoints in order
+    final endpoints = [
+      '/param.cgi?action=update&root.BackgroundMode=on',
+      '/api/v1/set_params?backgroundMode=on',
+      '/api/v1/start_record',
+    ];
+
+    for (final ep in endpoints) {
+      final res = await _get(ep);
+      if (res != null && res.statusCode == 200) {
+        setState(() {
+          _recording = true;
+          _loading = false;
+        });
+        _log('✅ Recording started!');
+        return;
+      }
+    }
+
+    _log('⚠️ Could not start — try tapping "Scan" to find correct endpoint');
+    setState(() => _loading = false);
+  }
+
+  // ── Stop Recording ───────────────────────────────────────
+  Future<void> _stopRecording() async {
+    if (!_loggedIn) {
+      await _login();
+    }
+    setState(() => _loading = true);
+    _log('⏹ Stopping recording...');
+
+    final endpoints = [
+      '/param.cgi?action=update&root.BackgroundMode=off',
+      '/api/v1/set_params?backgroundMode=off',
+      '/api/v1/stop_record',
+    ];
+
+    for (final ep in endpoints) {
+      final res = await _get(ep);
+      if (res != null && res.statusCode == 200) {
+        setState(() {
+          _recording = false;
+          _loading = false;
+        });
+        _log('✅ Recording stopped!');
+        return;
+      }
+    }
+
+    _log('⚠️ Could not stop');
+    setState(() => _loading = false);
+  }
+
+  // ── Get Status ───────────────────────────────────────────
+  Future<void> _getStatus() async {
+    if (!_loggedIn) {
+      await _login();
+    }
+    _log('🔍 Getting status...');
+    final res = await _get('/api/v1/get_status');
+    if (res != null && res.statusCode == 200) {
+      try {
+        final data = jsonDecode(res.body);
+        final bg = data['data']?['backgroundMode'] ?? false;
+        setState(() => _recording = bg);
+        _log('Status OK — backgroundMode: $bg');
+      } catch (_) {}
+    }
+  }
+
+  // ── Scan all known endpoints ─────────────────────────────
+  Future<void> _scan() async {
+    if (!_loggedIn) {
+      await _login();
+    }
+    _log('🔎 Scanning all endpoints...');
+
+    final endpoints = [
+      '/api/v1/get_status',
+      '/api/v1/get_cam_list',
+      '/param.cgi?action=update&root.BackgroundMode=on',
+      '/param.cgi?action=update&root.BackgroundMode=off',
+      '/api/v1/login',
+      '/',
+      '/index.htm',
+    ];
+
+    for (final ep in endpoints) {
+      final res = await _get(ep);
+      if (res != null) {
+        _log('${res.statusCode == 200 ? '✅' : '  '} $ep → ${res.statusCode}');
+      }
+    }
+    _log('🔎 Scan done');
+  }
+
+  // ── UI ───────────────────────────────────────────────────
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('TinyCam Controller'),
+        backgroundColor: Colors.grey[900],
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 14),
+            child: Center(
+              child: Row(
+                children: [
+                  Container(
+                    width: 9,
+                    height: 9,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _loggedIn ? Colors.greenAccent : Colors.red,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _loggedIn ? 'Online' : 'Offline',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+      backgroundColor: Colors.grey[850],
+      body: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            // ── Server address ──────────────────────────────
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.grey[800],
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                '$base  (user: $username)',
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontFamily: 'monospace',
+                  fontSize: 13,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+
+            const SizedBox(height: 14),
+
+            // ── Login button ────────────────────────────────
+            SizedBox(
+              width: double.infinity,
+              height: 46,
+              child: ElevatedButton.icon(
+                icon: const Icon(Icons.login),
+                label: Text(_loggedIn ? 'Re-Login' : 'Connect & Login'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _loggedIn
+                      ? Colors.grey[700]
+                      : Colors.blueAccent,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+                onPressed: _loading ? null : _login,
+              ),
+            ),
+
+            const SizedBox(height: 20),
+
+            // ── Recording indicator ─────────────────────────
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 22),
+              decoration: BoxDecoration(
+                color: _recording
+                    ? Colors.red.withOpacity(0.15)
+                    : Colors.grey[800],
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(
+                  color: _recording ? Colors.red : Colors.grey[700]!,
+                  width: 1.5,
+                ),
+              ),
+              child: Column(
+                children: [
+                  Icon(
+                    _recording
+                        ? Icons.fiber_manual_record
+                        : Icons.videocam_outlined,
+                    color: _recording ? Colors.red : Colors.grey,
+                    size: 36,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    _recording ? '● RECORDING' : 'STANDBY',
+                    style: TextStyle(
+                      color: _recording ? Colors.red : Colors.grey,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                      letterSpacing: 2,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            const SizedBox(height: 20),
+
+            // ── START / STOP ────────────────────────────────
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 58,
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.fiber_manual_record),
+                      label: const Text(
+                        'START',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.5,
+                        ),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red,
+                        disabledBackgroundColor: Colors.red.withOpacity(0.3),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      onPressed: _loading || _recording
+                          ? null
+                          : _startRecording,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: SizedBox(
+                    height: 58,
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.stop),
+                      label: const Text(
+                        'STOP',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.5,
+                        ),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.blueAccent,
+                        disabledBackgroundColor: Colors.blueAccent.withOpacity(
+                          0.3,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      onPressed: _loading || !_recording
+                          ? null
+                          : _stopRecording,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 12),
+
+            // ── Status + Scan ───────────────────────────────
+            Row(
+              children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 42,
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.refresh, size: 16),
+                      label: const Text('Get Status'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white54,
+                        side: BorderSide(color: Colors.grey[700]!),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      onPressed: _loading ? null : _getStatus,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: SizedBox(
+                    height: 42,
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.search, size: 16),
+                      label: const Text('Scan'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white54,
+                        side: BorderSide(color: Colors.grey[700]!),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      onPressed: _loading ? null : _scan,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 14),
+
+            // ── Log panel ───────────────────────────────────
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.grey[700]!),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Text(
+                          'LOG',
+                          style: TextStyle(
+                            color: Colors.white54,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 2,
+                          ),
+                        ),
+                        const Spacer(),
+                        GestureDetector(
+                          onTap: () => setState(() => _logs.clear()),
+                          child: const Text(
+                            'CLEAR',
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Expanded(
+                      child: _logs.isEmpty
+                          ? const Center(
+                              child: Text(
+                                'Tap "Connect & Login" to start',
+                                style: TextStyle(color: Colors.white24),
+                              ),
+                            )
+                          : ListView.builder(
+                              itemCount: _logs.length,
+                              itemBuilder: (_, i) => Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 1,
+                                ),
+                                child: Text(
+                                  _logs[i],
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 11,
+                                    color: _logs[i].contains('❌')
+                                        ? Colors.redAccent
+                                        : _logs[i].contains('✅')
+                                        ? Colors.greenAccent
+                                        : _logs[i].contains('⚠️')
+                                        ? Colors.orangeAccent
+                                        : Colors.white54,
+                                  ),
+                                ),
+                              ),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            if (_loading) ...[
+              const SizedBox(height: 10),
+              const LinearProgressIndicator(color: Colors.blueAccent),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}

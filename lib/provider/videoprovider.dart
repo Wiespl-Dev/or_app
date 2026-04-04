@@ -5,7 +5,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'package:webview_flutter/webview_flutter.dart';
-import 'package:wiespl_contrl_panel/or/orscreen.dart';
+import 'package:wiespl_contrl_panel/provider/orpi/orscreenpi.dart' show Patient;
 
 class VideoSwitcherProvider extends ChangeNotifier {
   // Basic state

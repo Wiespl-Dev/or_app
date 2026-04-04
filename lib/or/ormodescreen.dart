@@ -1,16 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:intl/intl.dart';
-
-import 'dart:math' as math;
-import 'dart:ui' as ui;
+import 'package:get/get.dart';
+import 'package:get/get_core/src/get_main.dart';
 import 'package:provider/provider.dart';
+import 'package:wiespl_contrl_panel/dicom/dicomscr.dart';
 import 'package:wiespl_contrl_panel/main.dart';
 import 'package:wiespl_contrl_panel/or/cleanpro.dart';
 import 'package:wiespl_contrl_panel/or/orscreen.dart';
 import 'package:wiespl_contrl_panel/pi_api/piscreen.dart';
 import 'package:wiespl_contrl_panel/provider/espprovider.dart';
 import 'package:wiespl_contrl_panel/provider/orsystemprovider.dart';
+import 'package:wiespl_contrl_panel/provider/streamrecorderprovider.dart'; // ← add this import
 import 'package:wiespl_contrl_panel/store/storescreen.dart';
 
 // --- OR MODE SCREEN ---
@@ -136,12 +136,15 @@ class ORModeScreen extends StatelessWidget {
                                     "OR SCREEN",
                                     Icons.desktop_windows,
                                     Colors.blue,
-                                    () => Navigator.push(
-                                      context,
-                                      MaterialPageRoute(
-                                        builder: (_) => StreamViewerScreen(),
-                                      ),
-                                    ),
+                                    () {
+                                      // ✅ FIX: Register controller before navigating
+                                      if (!Get.isRegistered<
+                                        RecorderController
+                                      >()) {
+                                        Get.put(RecorderController());
+                                      }
+                                      openRecorderPage(context);
+                                    },
                                   ),
                                 ),
                                 const SizedBox(width: 16),
@@ -185,8 +188,15 @@ class ORModeScreen extends StatelessWidget {
                                     "DICOM",
                                     Icons.medical_services,
                                     Colors.orange,
-                                    () =>
-                                        _launchDroidRenderAndEnterPip(context),
+                                    () {
+                                      Navigator.push(
+                                        context,
+                                        MaterialPageRoute(
+                                          builder: (context) =>
+                                              DicomViewerPage(),
+                                        ),
+                                      );
+                                    },
                                   ),
                                 ),
                                 const SizedBox(width: 16),

@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.example.wiespl_contrl_panel"
-    compileSdk = 35 // Changed from 36 to 35 for better stability with FFmpeg
+    compileSdk = 35
     ndkVersion = "27.0.12077973"
 
     compileOptions {
@@ -30,7 +30,6 @@ android {
         }
     }
 
-    // Fixed syntax for Kotlin Script
     packaging {
         resources {
             pickFirsts.add("lib/x86/libc++_shared.so")
@@ -42,13 +41,9 @@ android {
 
     buildTypes {
         getByName("release") {
-            // Using debug keys for testing release locally
             signingConfig = signingConfigs.getByName("debug")
-            
-            // Turn off for now to fix the JNI error
             isMinifyEnabled = false
             isShrinkResources = false
-            
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -59,4 +54,15 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Local AARs
+    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar", "*.jar"))))
+
+    // JPEG 2000 decoder
+    implementation("com.gemalto.jp2:jp2-android:1.0.3")
+
+    // Coroutines
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }

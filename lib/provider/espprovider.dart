@@ -4,128 +4,109 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+class _K {
+  // SharedPreferences key (was accidentally the IP string itself — fixed)
+  static const prefEsp32Ip = 'esp32_ip';
+
+  // ESP32 endpoints
+  static const epConnection = '/connection-test';
+  static const epAllParams = '/all-parameters';
+  static const epSensorData = '/sensor-data';
+  static const epLegacyData = '/data';
+  static const epControl = '/control';
+
+  // Setpoint guard
+  static const setpointGuard = Duration(seconds: 15);
+
+  // Sensor / light counts
+  static const lightCount = 10;
+  static const sensorCount = 10;
+
+  // Humidity clamp
+  static const minHumidity = 45.0;
+  static const maxHumidity = 55.0;
+  static const humidityStep = 0.5;
+
+  // Temperature clamp
+  static const minTemp = 16.0;
+  static const maxTemp = 24.0;
+
+  // HTTP timeouts
+  static const connectTimeout = Duration(seconds: 3);
+  static const fetchTimeout = Duration(seconds: 2);
+
+  // Polling interval
+  static const pollInterval = Duration(seconds: 3);
+
+  // Backward-compat light indices (0-based)
+  static const idxDefumigation = 7; // light 8
+  static const idxDayNight = 8; // light 9
+  static const idxSystemPower = 9; // light 10
+}
+
+// ─── Provider ─────────────────────────────────────────────────────────────────
+
 class ESP32Provider with ChangeNotifier {
-  // ESP32 connection
-  String _esp32IP = "192.168.1.119:8080"; // fallback default
-  String get esp32IP => _esp32IP;
-
-  Timer? _pollingTimer;
+  // ── Connection ────────────────────────────────────────────────────────────
+  String _esp32IP = '192.168.1.119:8080';
   bool _isConnected = false;
-  bool _isInitialized = false; // Track initialization status
+  bool _isInitialized = false;
+  Timer? _pollingTimer;
 
-  // Sensor data
-  String _currentTemperature = "0.0";
-  String _currentHumidity = "0.0";
-  String _pressureValue = "0";
+  String get esp32IP => _esp32IP;
+  bool get isConnected => _isConnected;
+
+  Uri _uri(String path) => Uri.parse('http://$_esp32IP$path');
+
+  // ── Sensor data ───────────────────────────────────────────────────────────
+  String _currentTemperature = '0.0';
+  String _currentHumidity = '0.0';
+  String _pressureValue = '0';
   bool _isPressurePositive = true;
 
-  // Humidity setpoint
-  String _humiditySetpoint = "50.0";
-
-  // Temperature setpoint
-  String _temperatureSetpoint = "25.0"; // Default value
-  double _pendingTemperature = 25.0; // For gauge interaction
-  DateTime? _temperatureSetpointGuardUntil;
-
-  // ── Setpoint guards ───────────────────────────────────────────────────────
-  static const Duration _setpointGuardDuration = Duration(seconds: 15);
-  DateTime? _humiditySetpointGuardUntil;
-
-  bool get _isHumidityGuardActive =>
-      _humiditySetpointGuardUntil != null &&
-      DateTime.now().isBefore(_humiditySetpointGuardUntil!);
-
-  bool get _isTemperatureGuardActive =>
-      _temperatureSetpointGuardUntil != null &&
-      DateTime.now().isBefore(_temperatureSetpointGuardUntil!);
-  // ─────────────────────────────────────────────────────────────────────────
-
-  // Light states
-  List<bool> _lightStates = List.filled(10, false);
-
-  // Sensor faults
-  List<String> _sensorFaults = List.filled(10, "-1");
-
-  // Backward compatibility control states - now mapped to lights 8, 9, 10
-  bool _defumigation = false; // Light 8
-  bool _systemPower = false; // Light 10
-  bool _dayNightMode = false; // Light 9
-
-  // ── Init ──────────────────────────────────────────────────────────────────
-
-  /// Constructor — automatically loads the saved IP from SharedPreferences and starts polling.
-  ESP32Provider() {
-    _initialize();
-  }
-
-  /// Internal: loads IP and starts polling.
-  Future<void> _initialize() async {
-    await _loadIP();
-    _isInitialized = true;
-    // Start polling after IP is loaded
-    startPolling();
-    // Force an immediate data fetch
-    await refreshData();
-    notifyListeners();
-  }
-
-  /// Internal: loads IP on startup.
-  Future<void> _loadIP() async {
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString('192.168.0.119:8080') ?? '';
-    if (saved.isNotEmpty) {
-      _esp32IP = saved;
-    } else {}
-    notifyListeners();
-  }
-
-  /// Public init — kept for backward compatibility.
-  Future<void> init() async {
-    if (!_isInitialized) {
-      await _initialize();
-    }
-  }
-
-  /// Update the ESP32 IP at runtime and persist it to SharedPreferences.
-  Future<void> updateESP32IP(String ip) async {
-    // Stop current polling
-    stopPolling();
-
-    _esp32IP = ip;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('esp32_ip', ip);
-
-    // Reset connection status
-    _isConnected = false;
-
-    // Restart polling with new IP
-    startPolling();
-
-    notifyListeners();
-  }
-
-  // ── Getters ───────────────────────────────────────────────────────────────
-  bool get isConnected => _isConnected;
   String get currentTemperature => _currentTemperature;
   String get currentHumidity => _currentHumidity;
   String get pressureValue => _pressureValue;
   bool get isPressurePositive => _isPressurePositive;
+  double get currentTemperatureAsDouble =>
+      double.tryParse(_currentTemperature) ?? 0.0;
+
+  // ── Setpoints ─────────────────────────────────────────────────────────────
+  String _humiditySetpoint = '50.0';
+  String _temperatureSetpoint = '25.0';
+  double _pendingTemperature = 25.0;
+  DateTime? _humidityGuardUntil;
+  DateTime? _temperatureGuardUntil;
 
   String get humiditySetpoint => _humiditySetpoint;
   double get humiditySetpointAsDouble =>
       double.tryParse(_humiditySetpoint) ?? 50.0;
-
-  // Temperature getters
   String get temperatureSetpoint => _temperatureSetpoint;
   double get temperatureSetpointAsDouble =>
       double.tryParse(_temperatureSetpoint) ?? 25.0;
   double get pendingTemperature => _pendingTemperature;
-  double get currentTemperatureAsDouble =>
-      double.tryParse(_currentTemperature) ?? 0.0;
 
+  bool get _humidityGuardActive =>
+      _humidityGuardUntil != null &&
+      DateTime.now().isBefore(_humidityGuardUntil!);
+
+  bool get _temperatureGuardActive =>
+      _temperatureGuardUntil != null &&
+      DateTime.now().isBefore(_temperatureGuardUntil!);
+
+  // ── Lights & sensors ──────────────────────────────────────────────────────
+  final List<bool> _lightStates = List.filled(_K.lightCount, false);
+  final List<String> _sensorFaults = List.filled(_K.sensorCount, '-1');
+
+  List<bool> get allLightStates => List.unmodifiable(_lightStates);
   List<String> get sensorFaults => List.unmodifiable(_sensorFaults);
 
-  // Individual light getters
+  bool getLightState(int index) =>
+      (index >= 0 && index < _lightStates.length) ? _lightStates[index] : false;
+
+  // Individual named getters (1-based, for external consumers)
   bool get light1 => _lightStates[0];
   bool get light2 => _lightStates[1];
   bool get light3 => _lightStates[2];
@@ -137,39 +118,87 @@ class ESP32Provider with ChangeNotifier {
   bool get light9 => _lightStates[8];
   bool get light10 => _lightStates[9];
 
-  // State getters (aliases)
-  bool get light1State => _lightStates[0];
-  bool get light2State => _lightStates[1];
-  bool get light3State => _lightStates[2];
-  bool get light4State => _lightStates[3];
-  bool get light5State => _lightStates[4];
-  bool get light6State => _lightStates[5];
-  bool get light7State => _lightStates[6];
-  bool get light8State => _lightStates[7];
-  bool get light9State => _lightStates[8];
-  bool get light10State => _lightStates[9];
+  // Aliases kept for backward compatibility
+  bool get light1State => light1;
+  bool get light2State => light2;
+  bool get light3State => light3;
+  bool get light4State => light4;
+  bool get light5State => light5;
+  bool get light6State => light6;
+  bool get light7State => light7;
+  bool get light8State => light8;
+  bool get light9State => light9;
+  bool get light10State => light10;
 
-  List<bool> get allLightStates => List.unmodifiable(_lightStates);
+  // Backward-compat semantic aliases
+  bool get defumigation => _lightStates[_K.idxDefumigation];
+  bool get dayNightMode => _lightStates[_K.idxDayNight];
+  bool get systemPower => _lightStates[_K.idxSystemPower];
 
-  bool getLightState(int index) {
-    if (index >= 0 && index < _lightStates.length) return _lightStates[index];
-    return false;
+  // ── Sensor helpers ────────────────────────────────────────────────────────
+  bool isSensorHealthy(int i) =>
+      i >= 0 && i < _sensorFaults.length && _sensorFaults[i] == '1';
+
+  Color getSensorColor(int i, Color healthyColor) =>
+      isSensorHealthy(i) ? healthyColor : Colors.red;
+
+  Color get sensor10Color => _sensorFaults.length > 9 && _sensorFaults[9] == '1'
+      ? Colors.green
+      : Colors.red;
+
+  bool get isMGPSHealthy =>
+      List.generate(4, (i) => isSensorHealthy(i)).every((ok) => ok);
+
+  Color get mgpsColor => isMGPSHealthy ? Colors.green : Colors.red;
+
+  // ── Pressure helpers ──────────────────────────────────────────────────────
+  String getFormattedPressure() {
+    final v = int.tryParse(_pressureValue) ?? 0;
+    return _isPressurePositive ? '$v' : '-$v';
   }
 
-  // Backward compatibility getters
-  bool get defumigation => _lightStates[7]; // Light 8 (index 7)
-  bool get systemPower => _lightStates[9]; // Light 10 (index 9)
-  bool get dayNightMode => _lightStates[8]; // Light 9 (index 8)
+  Color getPressureColor() =>
+      _isPressurePositive ? Colors.greenAccent : Colors.redAccent;
 
-  // ── Temperature Methods ───────────────────────────────────────────────────
+  // ── Init ──────────────────────────────────────────────────────────────────
+  ESP32Provider() {
+    _initialize();
+  }
 
+  Future<void> _initialize() async {
+    await _loadIP();
+    _isInitialized = true;
+    startPolling();
+    await refreshData();
+    notifyListeners();
+  }
+
+  Future<void> _loadIP() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_K.prefEsp32Ip) ?? '';
+    if (saved.isNotEmpty) _esp32IP = saved;
+  }
+
+  /// Public init kept for backward compatibility.
+  Future<void> init() async {
+    if (!_isInitialized) await _initialize();
+  }
+
+  Future<void> updateESP32IP(String ip) async {
+    stopPolling();
+    _esp32IP = ip;
+    _isConnected = false;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_K.prefEsp32Ip, ip);
+    startPolling();
+    notifyListeners();
+  }
+
+  // ── Temperature ───────────────────────────────────────────────────────────
   void updatePendingTemperature(double change) {
-    double newValue = _pendingTemperature + change;
-    if (newValue < 16) newValue = 16;
-    if (newValue > 24) newValue = 24;
-    _pendingTemperature = newValue;
-    print(
-      "🌡️ Pending temperature updated to: ${_pendingTemperature.toStringAsFixed(0)}°C",
+    _pendingTemperature = (_pendingTemperature + change).clamp(
+      _K.minTemp,
+      _K.maxTemp,
     );
     notifyListeners();
   }
@@ -177,110 +206,49 @@ class ESP32Provider with ChangeNotifier {
   Future<void> setTemperature(double temperature) async {
     _temperatureSetpoint = temperature.toStringAsFixed(0);
     _pendingTemperature = temperature;
-    _temperatureSetpointGuardUntil = DateTime.now().add(_setpointGuardDuration);
+    _temperatureGuardUntil = DateTime.now().add(_K.setpointGuard);
     notifyListeners();
-
-    final String temperatureValue = (temperature * 10).round().toString();
-    await _sendControl("S_TEMP_SETPT", temperatureValue);
+    await _sendControl('S_TEMP_SETPT', (temperature * 10).round().toString());
   }
 
-  Future<void> requestTemperatureStatus() async {
-    await refreshData();
-  }
+  /// Convenience alias.
+  Future<void> requestTemperatureStatus() => refreshData();
 
-  Color get sensor10Color {
-    if (_sensorFaults.length <= 9) return Colors.red;
-    return _sensorFaults[9] == "1" ? Colors.green : Colors.red;
-  }
-
-  bool isSensorHealthy(int index) {
-    if (index < 0 || index >= _sensorFaults.length) return false;
-    return _sensorFaults[index] == "1";
-  }
-
-  Color getSensorColor(int index, Color healthyColor) {
-    return isSensorHealthy(index) ? healthyColor : Colors.red;
-  }
-
-  bool get isMGPSHealthy {
-    for (int i = 0; i < 4; i++) {
-      if (_sensorFaults.length <= i || _sensorFaults[i] != "1") {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  Color get mgpsColor {
-    return isMGPSHealthy ? Colors.green : Colors.red;
-  }
-
-  // ── HUMIDITY METHODS ──────────────────────────────────────────────────────
-
-  static const double _minHumidity = 45.0;
-  static const double _maxHumidity = 55.0;
-  static const double _humidityStep = 0.5;
-
+  // ── Humidity ──────────────────────────────────────────────────────────────
   void adjustHumidity(double change) {
-    double newValue = humiditySetpointAsDouble + change;
-
-    // Clamp between min and max
-    newValue = newValue.clamp(_minHumidity, _maxHumidity);
-
-    // Round to step
-    newValue = (newValue / _humidityStep).round() * _humidityStep;
-
-    _humiditySetpoint = newValue.toStringAsFixed(1);
-
+    double v = (humiditySetpointAsDouble + change).clamp(
+      _K.minHumidity,
+      _K.maxHumidity,
+    );
+    v = (v / _K.humidityStep).round() * _K.humidityStep;
+    _humiditySetpoint = v.toStringAsFixed(1);
     notifyListeners();
   }
 
   Future<void> setHumiditySetpoint() async {
-    double value = humiditySetpointAsDouble;
-
-    final String humidityValue = (value * 10).round().toString().padLeft(
+    final encoded = (humiditySetpointAsDouble * 10).round().toString().padLeft(
       3,
       '0',
     );
-
-    // Activate guard before sending
-    _humiditySetpointGuardUntil = DateTime.now().add(_setpointGuardDuration);
-    print('🛡️ Humidity guard active until $_humiditySetpointGuardUntil');
-
-    await _sendControl("S_RH_SETPT", humidityValue);
+    _humidityGuardUntil = DateTime.now().add(_K.setpointGuard);
+    await _sendControl('S_RH_SETPT', encoded);
   }
 
-  // ── LIGHT METHODS ─────────────────────────────────────────────────────────
-
+  // ── Lights ────────────────────────────────────────────────────────────────
   Future<void> toggleLight(int lightNumber, bool value) async {
-    if (lightNumber < 1 || lightNumber > 10) {
-      print('❌ Invalid light number: $lightNumber');
-      return;
-    }
-    _lightStates[lightNumber - 1] = value;
-
-    // Update backward compatibility variables for lights 8, 9, 10
-    if (lightNumber == 8) _defumigation = value;
-    if (lightNumber == 9) _dayNightMode = value;
-    if (lightNumber == 10) _systemPower = value;
-
+    if (!_validLight(lightNumber)) return;
+    _setLight(lightNumber - 1, value);
     notifyListeners();
-    await _sendControl("S_Light_${lightNumber}_ON_OFF", value ? "1" : "0");
+    await _sendControl('S_Light_${lightNumber}_ON_OFF', value ? '1' : '0');
   }
 
-  Future<void> toggleMultipleLights(Map<int, bool> lightStates) async {
-    if (lightStates.isEmpty) return;
-    Map<String, String> controls = {};
-    lightStates.forEach((lightNumber, value) {
-      if (lightNumber >= 1 && lightNumber <= 10) {
-        _lightStates[lightNumber - 1] = value;
-
-        // Update backward compatibility variables for lights 8, 9, 10
-        if (lightNumber == 8) _defumigation = value;
-        if (lightNumber == 9) _dayNightMode = value;
-        if (lightNumber == 10) _systemPower = value;
-
-        controls["S_Light_${lightNumber}_ON_OFF"] = value ? "1" : "0";
+  Future<void> toggleMultipleLights(Map<int, bool> states) async {
+    if (states.isEmpty) return;
+    final controls = <String, String>{};
+    states.forEach((n, v) {
+      if (_validLight(n)) {
+        _setLight(n - 1, v);
+        controls['S_Light_${n}_ON_OFF'] = v ? '1' : '0';
       }
     });
     notifyListeners();
@@ -288,55 +256,45 @@ class ESP32Provider with ChangeNotifier {
   }
 
   Future<void> toggleAllLights(bool value) async {
-    Map<String, String> controls = {};
-
-    // Toggle ALL 10 lights
-    for (int i = 1; i <= 10; i++) {
-      _lightStates[i - 1] = value;
-      controls["S_Light_${i}_ON_OFF"] = value ? "1" : "0";
+    final controls = <String, String>{};
+    for (int i = 0; i < _K.lightCount; i++) {
+      _setLight(i, value);
+      controls['S_Light_${i + 1}_ON_OFF'] = value ? '1' : '0';
     }
-
-    // Update backward compatibility variables
-    _defumigation = value; // Light 8
-    _dayNightMode = value; // Light 9
-    _systemPower = value; // Light 10
-
     notifyListeners();
     await _sendMultipleControls(controls);
-    print('💡 All lights set to: $value');
   }
 
   Future<void> setLightPattern(List<bool> pattern) async {
-    if (pattern.length > 10) return;
-    Map<String, String> controls = {};
-    for (int i = 0; i < pattern.length && i < 10; i++) {
-      _lightStates[i] = pattern[i];
-      controls["S_Light_${i + 1}_ON_OFF"] = pattern[i] ? "1" : "0";
+    final controls = <String, String>{};
+    for (int i = 0; i < pattern.length && i < _K.lightCount; i++) {
+      _setLight(i, pattern[i]);
+      controls['S_Light_${i + 1}_ON_OFF'] = pattern[i] ? '1' : '0';
     }
-
-    // Update backward compatibility variables for lights 8, 9, 10
-    if (pattern.length > 7) _defumigation = pattern[7]; // Light 8 (index 7)
-    if (pattern.length > 8) _dayNightMode = pattern[8]; // Light 9 (index 8)
-    if (pattern.length > 9) _systemPower = pattern[9]; // Light 10 (index 9)
-
     notifyListeners();
     await _sendMultipleControls(controls);
   }
 
-  // Backward compatibility toggle methods
-  Future<void> toggleDefumigation(bool value) async => toggleLight(8, value);
-  Future<void> toggleSystemPower(bool value) async => toggleLight(10, value);
-  Future<void> toggleDayNightMode(bool value) async => toggleLight(9, value);
+  // Backward-compat semantic toggles
+  Future<void> toggleDefumigation(bool v) => toggleLight(8, v);
+  Future<void> toggleSystemPower(bool v) => toggleLight(10, v);
+  Future<void> toggleDayNightMode(bool v) => toggleLight(9, v);
+
+  /// Sets a single light state and keeps backward-compat aliases in sync.
+  void _setLight(int index, bool value) {
+    _lightStates[index] = value;
+  }
+
+  bool _validLight(int n) => n >= 1 && n <= _K.lightCount;
 
   // ── Polling ───────────────────────────────────────────────────────────────
   void startPolling() {
     stopPolling();
-    print('🔄 Starting polling to $_esp32IP');
-    _pollingTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
-      _checkConnection();
-      if (_isConnected) _fetchData();
+    _pollingTimer = Timer.periodic(_K.pollInterval, (_) async {
+      await _checkConnection();
+      if (_isConnected) await _fetchData();
     });
-    // Immediate first check
+    // Immediate first check without waiting for the timer
     _checkConnection();
   }
 
@@ -345,426 +303,308 @@ class ESP32Provider with ChangeNotifier {
     _pollingTimer = null;
   }
 
-  // ── FIX: Use _esp32IP instead of hardcoded IP ─────────────────────────────
-
-  Future<void> _checkConnection() async {
-    try {
-      final response = await http
-          .get(Uri.parse('http://$_esp32IP/connection-test')) // ✅ FIXED
-          .timeout(const Duration(seconds: 3));
-
-      if (response.statusCode == 200) {
-        if (!_isConnected) {
-          _isConnected = true;
-          print("✅ Connected to ESP32 at $_esp32IP");
-          // Fetch data immediately on connection
-          await _fetchData();
-          notifyListeners();
-        }
-      } else {
-        if (_isConnected) {
-          _isConnected = false;
-          print("❌ Connection lost to ESP32");
-          notifyListeners();
-        }
-      }
-    } catch (e) {
-      if (_isConnected) {
-        _isConnected = false;
-        print("❌ Disconnected from ESP32: $e");
-        notifyListeners();
-      }
-    }
+  Future<void> refreshData() async {
+    await _checkConnection();
+    if (_isConnected) await _fetchData();
   }
 
-  Future<void> refreshData() async {
-    print('🔄 Manual refresh triggered');
-    await _checkConnection();
-    if (_isConnected) {
-      await _fetchData();
-    } else {
-      print('⚠️ Not connected, cannot refresh');
+  // ── HTTP helpers ──────────────────────────────────────────────────────────
+  Future<void> _checkConnection() async {
+    try {
+      final res = await http
+          .get(_uri(_K.epConnection))
+          .timeout(_K.connectTimeout);
+      final ok = res.statusCode == 200;
+      if (ok != _isConnected) {
+        _isConnected = ok;
+        if (ok) await _fetchData();
+        notifyListeners();
+      }
+    } catch (_) {
+      if (_isConnected) {
+        _isConnected = false;
+        notifyListeners();
+      }
     }
   }
 
   Future<void> _fetchData() async {
     if (!_isConnected) return;
 
+    // 1. Try /all-parameters
     try {
-      print('📡 Trying /all-parameters at $_esp32IP...');
-      final response = await http
-          .get(Uri.parse('http://$_esp32IP/all-parameters')) // ✅ FIXED
-          .timeout(const Duration(seconds: 2));
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
+      final res = await http.get(_uri(_K.epAllParams)).timeout(_K.fetchTimeout);
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body) as Map<String, dynamic>;
         if (data.containsKey('sensor_faults')) {
           _parseAllParameters(data);
           return;
         }
       }
-    } catch (e) {
-      print("⚠️ /all-parameters failed: $e");
-    }
+    } catch (_) {}
 
+    // 2. Try /sensor-data
     try {
-      print('📡 Trying /sensor-data at $_esp32IP...');
-      final response = await http
-          .get(Uri.parse('http://$_esp32IP/sensor-data')) // ✅ FIXED
-          .timeout(const Duration(seconds: 2));
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        print('✅ Received sensor data: $data');
-        _parseSensorData(data);
+      final res = await http
+          .get(_uri(_K.epSensorData))
+          .timeout(_K.fetchTimeout);
+      if (res.statusCode == 200) {
+        _parseSensorData(json.decode(res.body) as Map<String, dynamic>);
         return;
       }
-    } catch (e) {
-      print("⚠️ /sensor-data failed: $e");
-    }
+    } catch (_) {}
 
+    // 3. Try legacy /data
     try {
-      print('📡 Trying /data at $_esp32IP...');
-      final response = await http
-          .get(Uri.parse('http://$_esp32IP/data')) // ✅ FIXED
-          .timeout(const Duration(seconds: 2));
-
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        String rawData = data['data'];
-        print('✅ Received legacy data: $rawData');
-        if (rawData.contains('F_Sensor')) {
-          _parseData(rawData);
+      final res = await http
+          .get(_uri(_K.epLegacyData))
+          .timeout(_K.fetchTimeout);
+      if (res.statusCode == 200) {
+        final raw =
+            (json.decode(res.body) as Map<String, dynamic>)['data'] as String?;
+        if (raw != null && raw.contains('F_Sensor')) {
+          _parseData(raw);
           return;
         }
       }
-    } catch (e) {
-      print("⚠️ /data failed: $e");
-    }
+    } catch (_) {}
 
-    print("❌ All endpoints failed");
+    // All endpoints failed
     _isConnected = false;
     notifyListeners();
   }
 
   // ── Parsers ───────────────────────────────────────────────────────────────
 
-  void _parseAllParameters(Map<String, dynamic> data) {
+  void _parseAllParameters(Map<String, dynamic> d) {
     bool changed = false;
 
-    try {
-      if (data['temperature'] != null) {
-        String newTemp = data['temperature'].toString();
-        print('🌡️ Temperature from ESP: $newTemp');
-        if (_currentTemperature != newTemp) {
-          _currentTemperature = newTemp;
-          changed = true;
-        }
-      }
+    changed |= _setIfChanged<String>(
+      () => _currentTemperature,
+      (v) => _currentTemperature = v,
+      d['temperature']?.toString(),
+    );
 
-      if (data['humidity'] != null) {
-        String newHumidity = data['humidity'].toString();
-        print('💧 Humidity from ESP: $newHumidity');
-        if (_currentHumidity != newHumidity) {
-          _currentHumidity = newHumidity;
-          changed = true;
-        }
-      }
+    changed |= _setIfChanged<String>(
+      () => _currentHumidity,
+      (v) => _currentHumidity = v,
+      d['humidity']?.toString(),
+    );
 
-      if (data['pressure2'] != null) {
-        int pressureInt = int.tryParse(data['pressure2'].toString()) ?? 0;
-        String newPressure = pressureInt.toString();
-        print('📊 Pressure from ESP: $newPressure');
-        if (_pressureValue != newPressure) {
-          _pressureValue = newPressure;
-          changed = true;
-        }
-      }
-
-      if (data['pressure2_positive'] != null) {
-        bool newPositive = data['pressure2_positive'] == true;
-        if (_isPressurePositive != newPositive) {
-          _isPressurePositive = newPositive;
-          changed = true;
-        }
-      }
-
-      if (data['sensor_faults'] != null && data['sensor_faults'] is List) {
-        final faultList = data['sensor_faults'] as List;
-        for (int i = 0; i < faultList.length && i < _sensorFaults.length; i++) {
-          String newValue = faultList[i].toString();
-          if (_sensorFaults[i] != newValue) {
-            _sensorFaults[i] = newValue;
-            changed = true;
-          }
-        }
-      }
-
-      if (data['humidity_setpoint'] != null) {
-        if (_isHumidityGuardActive) {
-          print('🛡️ Humidity guard active — ignoring ESP32 value');
-        } else {
-          String newSetpoint = data['humidity_setpoint'].toString();
-          if (_humiditySetpoint != newSetpoint) {
-            _humiditySetpoint = newSetpoint;
-            changed = true;
-            print('💧 Humidity setpoint updated: $_humiditySetpoint');
-          }
-        }
-      }
-
-      if (data['temperature_setpoint'] != null) {
-        if (_isTemperatureGuardActive) {
-          print('🛡️ Temperature guard active — ignoring ESP32 value');
-        } else {
-          String newSetpoint = data['temperature_setpoint'].toString();
-          if (_temperatureSetpoint != newSetpoint) {
-            _temperatureSetpoint = newSetpoint;
-            _pendingTemperature = double.tryParse(newSetpoint) ?? 25.0;
-            changed = true;
-            print('🌡️ Temperature setpoint updated: $_temperatureSetpoint');
-          }
-        }
-      }
-
-      if (data['light_status'] != null && data['light_status'] is List) {
-        final lightList = data['light_status'] as List;
-        for (int i = 0; i < lightList.length && i < _lightStates.length; i++) {
-          bool newState = lightList[i] == 1 || lightList[i] == "1";
-          if (_lightStates[i] != newState) {
-            _lightStates[i] = newState;
-            if (i == 7) _defumigation = newState;
-            if (i == 8) _dayNightMode = newState;
-            if (i == 9) _systemPower = newState;
-            changed = true;
-          }
-        }
-      }
-
-      if (changed) {
-        print('✅ Data changed, notifying listeners');
-        notifyListeners();
-      }
-    } catch (e) {
-      print("❌ Error parsing all parameters: $e");
+    if (d['pressure2'] != null) {
+      final v = (int.tryParse(d['pressure2'].toString()) ?? 0).toString();
+      changed |= _setIfChanged(
+        () => _pressureValue,
+        (x) => _pressureValue = x,
+        v,
+      );
     }
+
+    if (d['pressure2_positive'] != null) {
+      final v = d['pressure2_positive'] == true;
+      if (_isPressurePositive != v) {
+        _isPressurePositive = v;
+        changed = true;
+      }
+    }
+
+    if (d['sensor_faults'] is List) {
+      final list = d['sensor_faults'] as List;
+      for (int i = 0; i < list.length && i < _sensorFaults.length; i++) {
+        changed |= _setIfChanged(
+          () => _sensorFaults[i],
+          (v) => _sensorFaults[i] = v,
+          list[i].toString(),
+        );
+      }
+    }
+
+    if (d['humidity_setpoint'] != null && !_humidityGuardActive) {
+      changed |= _setIfChanged(
+        () => _humiditySetpoint,
+        (v) => _humiditySetpoint = v,
+        d['humidity_setpoint'].toString(),
+      );
+    }
+
+    if (d['temperature_setpoint'] != null && !_temperatureGuardActive) {
+      final v = d['temperature_setpoint'].toString();
+      if (_temperatureSetpoint != v) {
+        _temperatureSetpoint = v;
+        _pendingTemperature = double.tryParse(v) ?? 25.0;
+        changed = true;
+      }
+    }
+
+    if (d['light_status'] is List) {
+      final list = d['light_status'] as List;
+      for (int i = 0; i < list.length && i < _lightStates.length; i++) {
+        final v = list[i] == 1 || list[i] == '1';
+        if (_lightStates[i] != v) {
+          _setLight(i, v);
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) notifyListeners();
   }
 
-  void _parseSensorData(Map<String, dynamic> data) {
-    print('📊 Parsing sensor data');
+  void _parseSensorData(Map<String, dynamic> d) {
     bool changed = false;
 
-    try {
-      if (data['temperature'] != null) {
-        String newTemp = data['temperature'].toString();
-        if (_currentTemperature != newTemp) {
-          _currentTemperature = newTemp;
-          changed = true;
-        }
-      }
+    changed |= _setIfChanged(
+      () => _currentTemperature,
+      (v) => _currentTemperature = v,
+      d['temperature']?.toString(),
+    );
 
-      if (data['humidity'] != null) {
-        String newHumidity = data['humidity'].toString();
-        if (_currentHumidity != newHumidity) {
-          _currentHumidity = newHumidity;
-          changed = true;
-        }
-      }
+    changed |= _setIfChanged(
+      () => _currentHumidity,
+      (v) => _currentHumidity = v,
+      d['humidity']?.toString(),
+    );
 
-      if (data['pressure'] != null) {
-        final pressureDouble =
-            double.tryParse(data['pressure'].toString()) ?? 0.0;
-        int pressureInt = (pressureDouble * 100).toInt();
-        String newPressure = pressureInt.toString();
-        if (_pressureValue != newPressure) {
-          _pressureValue = newPressure;
-          changed = true;
-        }
-      }
-
-      if (data['pressure_positive'] != null) {
-        bool newPositive =
-            data['pressure_positive'] == true ||
-            data['pressure_positive'] == "1" ||
-            data['pressure_positive'] == 1;
-        if (_isPressurePositive != newPositive) {
-          _isPressurePositive = newPositive;
-          changed = true;
-        }
-      }
-
-      for (int i = 1; i <= 10; i++) {
-        String key1 = 'F_Sensor_${i}_FAULT_BIT';
-        String key2 = 'sensor_fault_$i';
-        if (data.containsKey(key1)) {
-          String newValue = data[key1].toString();
-          if (_sensorFaults[i - 1] != newValue) {
-            _sensorFaults[i - 1] = newValue;
-            changed = true;
-          }
-        } else if (data.containsKey(key2)) {
-          String newValue = data[key2].toString();
-          if (_sensorFaults[i - 1] != newValue) {
-            _sensorFaults[i - 1] = newValue;
-            changed = true;
-          }
-        }
-      }
-
-      if (changed) {
-        print('✅ Sensor data changed, notifying listeners');
-        notifyListeners();
-      }
-    } catch (e) {
-      print("❌ Error parsing sensor data: $e");
+    if (d['pressure'] != null) {
+      final v = ((double.tryParse(d['pressure'].toString()) ?? 0.0) * 100)
+          .toInt()
+          .toString();
+      changed |= _setIfChanged(
+        () => _pressureValue,
+        (x) => _pressureValue = x,
+        v,
+      );
     }
+
+    if (d['pressure_positive'] != null) {
+      final v =
+          d['pressure_positive'] == true ||
+          d['pressure_positive'] == '1' ||
+          d['pressure_positive'] == 1;
+      if (_isPressurePositive != v) {
+        _isPressurePositive = v;
+        changed = true;
+      }
+    }
+
+    for (int i = 1; i <= _K.sensorCount; i++) {
+      final raw = d['F_Sensor_${i}_FAULT_BIT'] ?? d['sensor_fault_$i'];
+      if (raw != null) {
+        changed |= _setIfChanged(
+          () => _sensorFaults[i - 1],
+          (v) => _sensorFaults[i - 1] = v,
+          raw.toString(),
+        );
+      }
+    }
+
+    if (changed) notifyListeners();
   }
+
+  static final _tempRx = RegExp(r'C_OT_TEMP:(\d+)');
+  static final _humidityRx = RegExp(r'C_RH:(\d+)');
+  static final _pressureRx = RegExp(r'C_PRESSURE_2:(\d+)');
+  static final _pressSignRx = RegExp(r'C_PRESSURE_2_SIGN_BIT:(\d+)');
 
   void _parseData(String data) {
-    print('🔄 Parsing legacy data');
     bool changed = false;
 
-    try {
-      final tempMatch = RegExp(r'C_OT_TEMP:(\d+)').firstMatch(data);
-      if (tempMatch != null) {
-        String newTemp = ((int.tryParse(tempMatch.group(1) ?? '0') ?? 0) / 10.0)
-            .toStringAsFixed(1);
-        if (_currentTemperature != newTemp) {
-          _currentTemperature = newTemp;
-          changed = true;
-        }
-      }
-
-      final humidityMatch = RegExp(r'C_RH:(\d+)').firstMatch(data);
-      if (humidityMatch != null) {
-        String newHumidity =
-            ((int.tryParse(humidityMatch.group(1) ?? '0') ?? 0) / 10.0)
-                .toStringAsFixed(1);
-        if (_currentHumidity != newHumidity) {
-          _currentHumidity = newHumidity;
-          changed = true;
-        }
-      }
-
-      final pressureMatch = RegExp(r'C_PRESSURE_2:(\d+)').firstMatch(data);
-      final pressureSignMatch = RegExp(
-        r'C_PRESSURE_2_SIGN_BIT:(\d+)',
-      ).firstMatch(data);
-      if (pressureMatch != null) {
-        final pressureInt = int.tryParse(pressureMatch.group(1) ?? '0') ?? 0;
-        String newPressure = (pressureInt * 100).toInt().toString();
-        if (_pressureValue != newPressure) {
-          _pressureValue = newPressure;
-          changed = true;
-        }
-        _isPressurePositive = pressureSignMatch?.group(1) == '0';
-      }
-
-      if (changed) {
-        print('✅ Legacy data changed, notifying listeners');
-        notifyListeners();
-      }
-    } catch (e) {
-      print("❌ Error parsing legacy data: $e");
+    final tMatch = _tempRx.firstMatch(data);
+    if (tMatch != null) {
+      final v = ((int.tryParse(tMatch.group(1) ?? '0') ?? 0) / 10.0)
+          .toStringAsFixed(1);
+      changed |= _setIfChanged(
+        () => _currentTemperature,
+        (x) => _currentTemperature = x,
+        v,
+      );
     }
+
+    final hMatch = _humidityRx.firstMatch(data);
+    if (hMatch != null) {
+      final v = ((int.tryParse(hMatch.group(1) ?? '0') ?? 0) / 10.0)
+          .toStringAsFixed(1);
+      changed |= _setIfChanged(
+        () => _currentHumidity,
+        (x) => _currentHumidity = x,
+        v,
+      );
+    }
+
+    final pMatch = _pressureRx.firstMatch(data);
+    if (pMatch != null) {
+      final v = ((int.tryParse(pMatch.group(1) ?? '0') ?? 0) * 100).toString();
+      changed |= _setIfChanged(
+        () => _pressureValue,
+        (x) => _pressureValue = x,
+        v,
+      );
+      _isPressurePositive = _pressSignRx.firstMatch(data)?.group(1) == '0';
+    }
+
+    if (changed) notifyListeners();
   }
 
   // ── Controls ──────────────────────────────────────────────────────────────
 
-  Future<void> sendControl(String key, String value) async {
-    await _sendControl(key, value);
-  }
+  /// Public alias for external callers.
+  Future<void> sendControl(String key, String value) =>
+      _sendControl(key, value);
 
   Future<void> _sendControl(String key, String value) async {
-    print('🚀 Sending control: $key = $value to $_esp32IP');
     try {
-      final response = await http
-          .post(
-            Uri.parse('http://$_esp32IP/control'), // ✅ FIXED
-            body: {key: value},
-          )
-          .timeout(const Duration(seconds: 3));
+      final res = await http
+          .post(_uri(_K.epControl), body: {key: value})
+          .timeout(_K.connectTimeout);
 
-      if (response.statusCode == 200) {
-        print('✅ Control $key = $value confirmed by ESP32');
-
-        if (key == "S_RH_SETPT") {
-          print(
-            '🛡️ Humidity guard remains active until $_humiditySetpointGuardUntil',
-          );
-        } else if (key == "S_TEMP_SETPT") {
-          print(
-            '🛡️ Temperature guard remains active until $_temperatureSetpointGuardUntil',
-          );
-        } else if (key.startsWith("S_Light_") && key.endsWith("_ON_OFF")) {
-          final lightNumber =
-              int.tryParse(key.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0;
-          if (lightNumber >= 1 && lightNumber <= 10) {
-            _lightStates[lightNumber - 1] = value == "1";
-
-            if (lightNumber == 8) _defumigation = value == "1";
-            if (lightNumber == 9) _dayNightMode = value == "1";
-            if (lightNumber == 10) _systemPower = value == "1";
-
-            notifyListeners();
-          }
-        }
+      if (res.statusCode == 200) {
+        _applyLightFromKey(key, value);
       } else {
-        print('❌ Control failed: ${response.statusCode}');
-        throw Exception('Control failed: ${response.statusCode}');
+        throw Exception('Control failed: ${res.statusCode}');
       }
     } catch (e) {
-      print("❌ Failed to send control: $e");
       rethrow;
     }
   }
 
   Future<void> _sendMultipleControls(Map<String, String> controls) async {
-    print('🚀 Sending multiple controls to $_esp32IP: $controls');
     try {
-      final response = await http
-          .post(
-            Uri.parse('http://$_esp32IP/control'), // ✅ FIXED
-            body: controls,
-          )
-          .timeout(const Duration(seconds: 3));
+      final res = await http
+          .post(_uri(_K.epControl), body: controls)
+          .timeout(_K.connectTimeout);
 
-      if (response.statusCode == 200) {
-        print('✅ Multiple controls confirmed');
-        controls.forEach((key, value) {
-          if (key.startsWith("S_Light_") && key.endsWith("_ON_OFF")) {
-            final n = int.tryParse(key.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0;
-            if (n >= 1 && n <= 10) {
-              _lightStates[n - 1] = value == "1";
-
-              // Update backward compatibility variables for lights 8, 9, 10
-              if (n == 8) _defumigation = value == "1";
-              if (n == 9) _dayNightMode = value == "1";
-              if (n == 10) _systemPower = value == "1";
-            }
-          }
-        });
+      if (res.statusCode == 200) {
+        controls.forEach(_applyLightFromKey);
         notifyListeners();
-      } else {
-        print('❌ Multiple controls failed: ${response.statusCode}');
       }
-    } catch (e) {
-      print("❌ Multiple controls error: $e");
-    }
+    } catch (_) {}
   }
 
-  // ── Utilities ─────────────────────────────────────────────────────────────
-
-  String getFormattedPressure() {
-    int pressureInt = int.tryParse(_pressureValue) ?? 0;
-    String formattedValue = pressureInt.toString();
-    return _isPressurePositive ? formattedValue : "-$formattedValue";
+  /// Parses a control key like `S_Light_3_ON_OFF` and applies the state locally.
+  void _applyLightFromKey(String key, String value) {
+    if (!key.startsWith('S_Light_') || !key.endsWith('_ON_OFF')) return;
+    final n = int.tryParse(key.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0;
+    if (!_validLight(n)) return;
+    _setLight(n - 1, value == '1');
+    notifyListeners();
   }
 
-  Color getPressureColor() {
-    return _isPressurePositive ? Colors.greenAccent : Colors.redAccent;
+  // ── Utility: generic change-detector ─────────────────────────────────────
+
+  /// Returns `true` if the value changed and assigns it.
+  /// Skips assignment if [newVal] is null.
+  bool _setIfChanged<T>(
+    T Function() getter,
+    void Function(T) setter,
+    T? newVal,
+  ) {
+    if (newVal == null) return false;
+    if (getter() == newVal) return false;
+    setter(newVal);
+    return true;
   }
 
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
   @override
   void dispose() {
     stopPolling();

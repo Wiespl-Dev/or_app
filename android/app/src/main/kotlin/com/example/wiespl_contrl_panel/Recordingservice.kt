@@ -17,10 +17,12 @@ class RecordingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
 
     companion object {
-        const val CHANNEL_ID = "recording_channel"
+        const val CHANNEL_ID      = "recording_channel"
         const val NOTIFICATION_ID = 1001
-        const val ACTION_START = "ACTION_START"
-        const val ACTION_STOP = "ACTION_STOP"
+        const val ACTION_START    = "ACTION_START"
+        const val ACTION_STOP     = "ACTION_STOP"
+        const val ACTION_UPDATE   = "ACTION_UPDATE"
+        const val EXTRA_TEXT      = "extra_text"
     }
 
     override fun onCreate() {
@@ -44,11 +46,22 @@ class RecordingService : Service() {
             }
             ACTION_STOP -> {
                 releaseWakeLock()
-                stopForeground(true)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    @Suppress("DEPRECATION")
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
                 stopSelf()
             }
+            ACTION_UPDATE -> {
+                val text = intent.getStringExtra(EXTRA_TEXT) ?: "Recording in progress…"
+                val nm = getSystemService(NotificationManager::class.java)
+                nm.notify(NOTIFICATION_ID, buildNotification(text))
+            }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -64,7 +77,7 @@ class RecordingService : Service() {
             PowerManager.PARTIAL_WAKE_LOCK,
             "wiespl_contrl_panel::RecordingWakeLock"
         ).apply {
-            acquire(6 * 60 * 60 * 1000L)
+            acquire(3 * 60 * 60 * 1000L) // 3 hours
         }
     }
 
@@ -78,9 +91,8 @@ class RecordingService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val stopIntent = Intent(this, RecordingService::class.java).apply {
-            action = ACTION_STOP
-        }
+        val stopIntent = Intent(this, RecordingService::class.java)
+            .apply { action = ACTION_STOP }
         val stopPending = PendingIntent.getService(
             this, 0, stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -97,7 +109,7 @@ class RecordingService : Service() {
             .setContentIntent(launchPending)
             .addAction(android.R.drawable.ic_media_pause, "Stop", stopPending)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
@@ -110,9 +122,12 @@ class RecordingService : Service() {
             ).apply {
                 description = "Shows while stream recording is active"
                 setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                enableLights(false)
             }
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(channel)
         }
     }
 }

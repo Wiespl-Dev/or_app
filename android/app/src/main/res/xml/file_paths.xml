@@ -1,9 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <!-- External app-specific storage: /storage/emulated/0/Android/data/com.example.wiespl_contrl_panel/files/ -->
-    <external-files-path name="recordings" path="Recordings/" />
-    <!-- Internal cache: /data/data/com.example.wiespl_contrl_panel/cache/ -->
+    <!-- App internal storage -->
+    <files-path name="files" path="." />
     <cache-path name="cache" path="." />
-    <!-- Fallback: entire external storage -->
-    <external-path name="external" path="." />
+
+    <!-- App external storage -->
+    <external-files-path name="external_files" path="." />
+
+    <!-- All of external storage (covers Downloads, DCIM, custom paths) -->
+    <external-path name="external_storage" path="." />
+
+    <!-- Root storage (covers /storage/emulated/0 and USB paths) -->
+    <root-path name="root" path="/" />
 </paths>

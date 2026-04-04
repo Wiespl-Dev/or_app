@@ -2,6 +2,8 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        // Appodeal repository — hosts com.gemalto.jp2:jp2-android
+        maven { url = uri("https://artifactory.appodeal.com/appodeal-public/") }
     }
 }
 
