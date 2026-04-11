@@ -1,16 +1,4 @@
-// recorder_controller.dart
-//
-// CHANGES IN THIS VERSION vs previous:
-//
-//  + StorageOption model added (top-level).
-//  + availableStorages / selectedStorage reactive fields added.
-//  + refreshStorages() scans all Android volumes (internal + USB / HDD).
-//  + _resolveRecDir() now derives the path from selectedStorage instead of
-//    the raw saveDir string, but keeps saveDir in sync for backwards compat.
-//  + initAfterFrame() calls refreshStorages() (fire-and-forget, non-blocking).
-//  + WidgetsBindingObserver integration: page calls refreshStorages() on
-//    resume — no changes needed here for that; it is driven from the page.
-//
+// streamrecorderprovider.dart
 import 'dart:async';
 import 'dart:io';
 
@@ -62,19 +50,28 @@ Future<void> openVideo(String path) async {
 
 // ─── StorageOption ─────────────────────────────────────────────────────────────
 /// Represents one writable storage volume (internal app dir or USB / HDD).
+///
+/// [path]     – app-specific path from path_provider (Android/data/...)
+/// [rootPath] – the real volume root (e.g. /storage/emulated/0 or /storage/XXXX-XXXX)
+///              Use this to write to Documents, Downloads, etc.
 class StorageOption {
-  final String label; // e.g. "Internal Storage", "USB Drive (ABCD-1234)"
-  final String path; // absolute directory path for recordings
-  final bool isRemovable; // true for USB / SD card / HDD
+  final String label;
+  final String path; // app-specific (kept for backwards-compat)
+  final String rootPath; // actual volume root → use for Documents folder
+  final bool isRemovable;
 
   const StorageOption({
     required this.label,
     required this.path,
+    required this.rootPath,
     required this.isRemovable,
   });
 
+  /// Absolute path to the Documents folder on this volume.
+  String get documentsPath => '$rootPath/Documents';
+
   @override
-  String toString() => '$label ($path)';
+  String toString() => '$label ($rootPath)';
 }
 
 // ─── Models ───────────────────────────────────────────────────────────────────
@@ -89,7 +86,6 @@ class AppSource {
     required this.baseUrl,
   });
 
-  /// URL used by FFmpeg for recording (with resolution query params).
   String urlWithRes(int w, int h) =>
       '$baseUrl?action=stream&width=$w&height=$h';
 }
@@ -132,38 +128,33 @@ class RecorderController extends GetxController {
   };
 
   static const hdmi1Cameras = <String, String>{
-    'Camera 1': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9081',
-    'Camera 2': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9082',
-    'Camera 3': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9083',
-    'Camera 4': 'http://192.168.1.131:8080/hdmi1?url=http://192.168.1.131:9084',
+    'Camera 1': 'http://192.168.1.131:9090/hdmi1?url=http://192.168.1.131:9081',
+    'Camera 2': 'http://192.168.1.131:9090/hdmi1?url=http://192.168.1.131:9082',
+    'Camera 3': 'http://192.168.1.131:9090/hdmi1?url=http://192.168.1.131:9083',
+    'Camera 4': 'http://192.168.1.131:9090/hdmi1?url=http://192.168.1.131:9084',
   };
   static const hdmi2Cameras = <String, String>{
-    'Camera 1': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9081',
-    'Camera 2': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9082',
-    'Camera 3': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9083',
-    'Camera 4': 'http://192.168.1.131:8080/hdmi2?url=http://192.168.1.131:9084',
+    'Camera 1': 'http://192.168.1.131:9090/hdmi2?url=http://192.168.1.131:9081',
+    'Camera 2': 'http://192.168.1.131:9090/hdmi2?url=http://192.168.1.131:9082',
+    'Camera 3': 'http://192.168.1.131:9090/hdmi2?url=http://192.168.1.131:9083',
+    'Camera 4': 'http://192.168.1.131:9090/hdmi2?url=http://192.168.1.131:9084',
   };
 
-  // ── Core reactive state ────────────────────────────────────────────────
+  // ── Core reactive state ─────────────────────────────────────────────────
   final activeIdx = 0.obs;
   final selectedRes = 'HD (1280x720)'.obs;
   final selectedHDMI = 'hdmi1'.obs;
   final selectedCam = 'Camera 1'.obs;
 
-  // ── Storage state ──────────────────────────────────────────────────────
-  /// All volumes currently detected as writable on this device.
+  // ── Storage state ───────────────────────────────────────────────────────
   final availableStorages = <StorageOption>[].obs;
-
-  /// The volume currently chosen for saving recordings.
-  /// Null only before the first [refreshStorages] call completes.
   final selectedStorage = Rxn<StorageOption>();
 
-  /// Raw path string — kept in sync with selectedStorage for FFmpeg and
-  /// backwards-compatible callers.  Do NOT write to this directly from UI;
-  /// set [selectedStorage] instead and let the watcher below update it.
-  final saveDir = '/storage/emulated/0/Recordings'.obs;
+  /// Kept in sync with selectedStorage.rootPath/Documents for FFmpeg default
+  /// output (when no patient session path is provided).
+  final saveDir = '/storage/emulated/0/Documents/WIESPL_Recordings'.obs;
 
-  // ── Internal ───────────────────────────────────────────────────────────
+  // ── Internal ────────────────────────────────────────────────────────────
   late final List<SourceSlot> slots;
   bool _frameInitDone = false;
 
@@ -172,28 +163,26 @@ class RecorderController extends GetxController {
   SourceSlot get activeSlot => slots[activeIdx.value];
   bool get anyRecording => slots.any((s) => s.recording.value);
 
-  // ── onInit ─────────────────────────────────────────────────────────────
+  // ── onInit ──────────────────────────────────────────────────────────────
   @override
   void onInit() {
     super.onInit();
     slots = List.generate(sources.length, (i) => SourceSlot(sources[i]));
 
-    // Keep saveDir in sync whenever the user picks a different storage volume.
     ever(selectedStorage, (StorageOption? opt) {
-      if (opt != null) saveDir.value = '${opt.path}/WIESPL_Recordings';
+      if (opt != null) {
+        saveDir.value = '${opt.documentsPath}/WIESPL_Recordings';
+      }
     });
   }
 
-  // ── initAfterFrame ─────────────────────────────────────────────────────
-  // Called by RecorderPage via addPostFrameCallback — nothing blocks here.
+  // ── initAfterFrame ──────────────────────────────────────────────────────
   void initAfterFrame() {
     if (_frameInitDone) return;
     _frameInitDone = true;
 
-    // Permissions — inline dialogs, fast.
     _firePerms([Permission.storage, Permission.notification]);
 
-    // Settings-level permissions: delay so the page paints first.
     Future.delayed(
       const Duration(seconds: 3),
       () => _firePerms([
@@ -202,7 +191,6 @@ class RecorderController extends GetxController {
       ]),
     );
 
-    // Non-blocking storage scan — UI is not held.
     refreshStorages();
   }
 
@@ -216,13 +204,14 @@ class RecorderController extends GetxController {
     }
   }
 
-  // ── refreshStorages ────────────────────────────────────────────────────
-  /// Scans all Android storage volumes and updates [availableStorages].
-  /// Safe to call at any time (page resume, pull-to-refresh, etc.).
+  // ── refreshStorages ──────────────────────────────────────────────────────
+  /// Scans all Android storage volumes. Computes [StorageOption.rootPath]
+  /// by stripping the Android/data/... app-specific suffix so recordings
+  /// land in the real Documents folder, not inside the app's sandboxed dir.
   Future<void> refreshStorages() async {
     final found = <StorageOption>[];
 
-    // ── path_provider: covers internal + most removable volumes ─────────
+    // ── path_provider volumes ────────────────────────────────────────────
     try {
       final dirs = await getExternalStorageDirectories();
       if (dirs != null) {
@@ -230,22 +219,26 @@ class RecorderController extends GetxController {
           final dir = dirs[i];
           await dir.create(recursive: true);
 
-          // /storage/emulated/0/... → internal flash
-          // /storage/XXXX-XXXX/...  → USB / SD / HDD
           final isRemovable = !dir.path.contains('/emulated/');
+
+          // Strip Android/data/... to get the real volume root.
+          final rootPath = _volumeRoot(dir.path);
+
           String label;
           if (!isRemovable) {
             label = 'Internal Storage';
           } else {
-            final segments = dir.path.split('/');
-            final volumeId = segments.length > 2 ? segments[2] : 'Removable';
-            label = i == 1 ? 'USB / HDD ($volumeId)' : 'Drive $i ($volumeId)';
+            final volId = rootPath
+                .split('/')
+                .lastWhere((s) => s.isNotEmpty, orElse: () => 'Removable');
+            label = i == 1 ? 'USB / HDD ($volId)' : 'Drive $i ($volId)';
           }
 
           found.add(
             StorageOption(
               label: label,
               path: dir.path,
+              rootPath: rootPath,
               isRemovable: isRemovable,
             ),
           );
@@ -255,7 +248,7 @@ class RecorderController extends GetxController {
       debugPrint('refreshStorages/path_provider: $e');
     }
 
-    // ── Fallback: scan /storage for OTG drives path_provider may miss ───
+    // ── Fallback: scan /storage for OTG drives ────────────────────────────
     try {
       final storageRoot = Directory('/storage');
       if (storageRoot.existsSync()) {
@@ -263,10 +256,9 @@ class RecorderController extends GetxController {
             .listSync()
             .whereType<Directory>()
             .where((d) => !d.path.endsWith('/emulated'))
-            .where((d) => !found.any((f) => f.path.startsWith(d.path)));
+            .where((d) => !found.any((f) => f.rootPath == d.path));
 
         for (final vol in candidates) {
-          // Write-test to confirm this volume is actually usable.
           final testFile = File('${vol.path}/.wiespl_write_test');
           try {
             await testFile.writeAsString('ok');
@@ -276,12 +268,11 @@ class RecorderController extends GetxController {
               StorageOption(
                 label: 'External Drive ($volId)',
                 path: vol.path,
+                rootPath: vol.path, // already the root for manual-scan volumes
                 isRemovable: true,
               ),
             );
-          } catch (_) {
-            // Volume not writable — skip silently.
-          }
+          } catch (_) {}
         }
       }
     } catch (e) {
@@ -290,13 +281,10 @@ class RecorderController extends GetxController {
 
     availableStorages.assignAll(found);
 
-    // ── Auto-select logic ────────────────────────────────────────────────
-    // 1. If the previously selected volume is still mounted → keep it.
-    // 2. Otherwise prefer USB / HDD over internal (useful when a drive is
-    //    plugged in and the user opens the page).
-    // 3. Fall back to the first available volume.
+    // Auto-select: keep previous if still mounted, else prefer removable.
     final prev = selectedStorage.value;
-    final stillMounted = prev != null && found.any((s) => s.path == prev.path);
+    final stillMounted =
+        prev != null && found.any((s) => s.rootPath == prev.rootPath);
 
     if (!stillMounted) {
       selectedStorage.value =
@@ -304,9 +292,17 @@ class RecorderController extends GetxController {
     }
 
     debugPrint(
-      'refreshStorages: ${found.length} volume(s) found. '
-      'Selected → ${selectedStorage.value?.label ?? "none"}',
+      'refreshStorages: ${found.length} volume(s). '
+      'Selected → ${selectedStorage.value?.label ?? "none"} '
+      '(root: ${selectedStorage.value?.rootPath})',
     );
+  }
+
+  /// Strips the Android/data/<package>/files (or similar) suffix to return
+  /// the raw volume root (e.g. /storage/emulated/0 or /storage/XXXX-XXXX).
+  static String _volumeRoot(String appPath) {
+    final idx = appPath.indexOf('/Android/');
+    return idx != -1 ? appPath.substring(0, idx) : appPath;
   }
 
   // ── onClose ─────────────────────────────────────────────────────────────
@@ -321,26 +317,26 @@ class RecorderController extends GetxController {
     super.onClose();
   }
 
-  // ── Source switching ────────────────────────────────────────────────────
+  // ── Source switching ─────────────────────────────────────────────────────
   void switchSource(int idx) {
     if (activeIdx.value == idx) return;
     activeIdx.value = idx;
   }
 
-  // ── Resolution ──────────────────────────────────────────────────────────
+  // ── Resolution ───────────────────────────────────────────────────────────
   void setResolution(String r) {
     if (anyRecording) return;
     selectedRes.value = r;
   }
 
-  // ── Refresh WebView ─────────────────────────────────────────────────────
+  // ── Refresh WebView ──────────────────────────────────────────────────────
   void refreshActive() {
     final cur = activeIdx.value;
     activeIdx.value = -1;
     Future.microtask(() => activeIdx.value = cur);
   }
 
-  // ── HDMI camera switch ──────────────────────────────────────────────────
+  // ── HDMI camera switch ───────────────────────────────────────────────────
   Future<bool> switchCamera(String hdmi, String camName, String url) async {
     try {
       final r = await http
@@ -355,7 +351,7 @@ class RecorderController extends GetxController {
     return false;
   }
 
-  // ── FFmpeg helpers ──────────────────────────────────────────────────────
+  // ── FFmpeg helpers ───────────────────────────────────────────────────────
   Map<String, dynamic> _profile(int w) {
     if (w >= 3840)
       return {'fps': 5, 'preset': 'ultrafast', 'crf': 35, 'threads': 1};
@@ -407,55 +403,41 @@ class RecorderController extends GetxController {
     ];
   }
 
-  // ── Resolve the save directory ──────────────────────────────────────────
-  // Priority:
-  //   1. selectedStorage volume (USB / HDD / internal — user's explicit pick)
-  //   2. saveDir string (legacy / direct override)
-  //   3. App external storage (ultimate fallback — always writable)
-  Future<Directory> _resolveRecDir() async {
-    // 1. selectedStorage (preferred — set by storage picker)
+  // ── Default recordings directory (no patient session) ────────────────────
+  /// Falls back to Documents/WIESPL_Recordings on the selected volume, or
+  /// the app's external storage directory as last resort.
+  Future<Directory> _resolveDefaultRecDir() async {
     final sel = selectedStorage.value;
     if (sel != null) {
       try {
-        final dir = Directory('${sel.path}/WIESPL_Recordings');
+        final dir = Directory('${sel.documentsPath}/WIESPL_Recordings');
         if (!dir.existsSync()) dir.createSync(recursive: true);
-        final testFile = File('${dir.path}/.write_test');
-        testFile.writeAsBytesSync([]);
-        testFile.deleteSync();
-        saveDir.value = dir.path; // keep saveDir in sync
+        // quick write-test
+        final t = File('${dir.path}/.wtest');
+        t.writeAsBytesSync([]);
+        t.deleteSync();
+        saveDir.value = dir.path;
         return dir;
       } catch (e) {
-        debugPrint('selectedStorage not writable (${sel.path}): $e');
+        debugPrint('_resolveDefaultRecDir/${sel.label}: $e');
       }
     }
 
-    // 2. Raw saveDir string (backwards compat / manual override)
-    final chosen = saveDir.value.trim();
-    if (chosen.isNotEmpty) {
-      try {
-        final dir = Directory(chosen);
-        if (!dir.existsSync()) dir.createSync(recursive: true);
-        final testFile = File('${dir.path}/.write_test');
-        testFile.writeAsBytesSync([]);
-        testFile.deleteSync();
-        return dir;
-      } catch (e) {
-        debugPrint('saveDir not writable ($chosen): $e — falling back');
-      }
-    }
-
-    // 3. App external storage fallback
-    final extDir = Platform.isAndroid
+    // fallback
+    final ext = Platform.isAndroid
         ? await getExternalStorageDirectory()
         : await getApplicationDocumentsDirectory();
-    final fallback = Directory('${extDir!.path}/Recordings');
-    if (!fallback.existsSync()) fallback.createSync(recursive: true);
-    saveDir.value = fallback.path;
-    return fallback;
+    final fb = Directory('${ext!.path}/WIESPL_Recordings');
+    if (!fb.existsSync()) fb.createSync(recursive: true);
+    saveDir.value = fb.path;
+    return fb;
   }
 
-  // ── Start recording ─────────────────────────────────────────────────────
-  Future<void> startRecording(int idx) async {
+  // ── Start recording ──────────────────────────────────────────────────────
+  /// [outputDir] – absolute path to the Recordings sub-folder inside the
+  ///               patient session (e.g. .../Source_1/Recordings).
+  ///               When null the default directory is used.
+  Future<void> startRecording(int idx, {String? outputDir}) async {
     final slot = slots[idx];
     if (slot.recording.value || slot.finalising.value) return;
 
@@ -470,10 +452,24 @@ class RecorderController extends GetxController {
       final ts = DateTime.now().millisecondsSinceEpoch;
       final w = resW;
       final h = resH;
-
-      final recDir = await _resolveRecDir();
       final tag = sources[idx].name.replaceAll(' ', '').toLowerCase();
-      slot.outputPath = '${recDir.path}/rec_${w}x${h}_${tag}_$ts.mp4';
+
+      // ── Resolve output path ──────────────────────────────────────────────
+      final String recDir;
+      if (outputDir != null && outputDir.isNotEmpty) {
+        // Patient session folder provided by the UI.
+        recDir = outputDir;
+        final d = Directory(recDir);
+        if (!d.existsSync()) d.createSync(recursive: true);
+      } else {
+        // No session → default Documents/WIESPL_Recordings.
+        final d = await _resolveDefaultRecDir();
+        recDir = d.path;
+      }
+
+      final finalOutputPath = '$recDir/rec_${w}x${h}_${tag}_$ts.mp4';
+
+      slot.outputPath = finalOutputPath;
       slot.ffDone = Completer<void>();
 
       slot.ffSession = await FFmpegKit.executeWithArgumentsAsync(
@@ -501,7 +497,6 @@ class RecorderController extends GetxController {
       slot.startTime.value = DateTime.now();
       slot.status.value = '';
 
-      // Poll output file size every second for the live byte counter.
       slot.bytesTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         try {
           final f = File(slot.outputPath!);
@@ -524,7 +519,7 @@ class RecorderController extends GetxController {
     }
   }
 
-  // ── Stop recording ──────────────────────────────────────────────────────
+  // ── Stop recording ───────────────────────────────────────────────────────
   void stopRecording(int idx) {
     final slot = slots[idx];
     if (!slot.recording.value) return;
@@ -567,36 +562,37 @@ class RecorderController extends GetxController {
     );
   }
 
-  // ── Recordings list ─────────────────────────────────────────────────────
-  // Always reads from the same directory that recordings are written to.
+  // ── Recordings list ──────────────────────────────────────────────────────
   Future<List<FileSystemEntity>> getRecordings() async {
     try {
       final chosen = saveDir.value.trim();
       if (chosen.isNotEmpty) {
         final dir = Directory(chosen);
         if (dir.existsSync()) {
-          final list =
-              dir.listSync().where((f) => f.path.endsWith('.mp4')).toList()
-                ..sort((a, b) => b.path.compareTo(a.path));
-          return list;
+          return dir
+              .listSync(recursive: true)
+              .where((f) => f.path.endsWith('.mp4'))
+              .toList()
+            ..sort((a, b) => b.path.compareTo(a.path));
         }
       }
-
-      // Fallback
       final d = Platform.isAndroid
           ? await getExternalStorageDirectory()
           : await getApplicationDocumentsDirectory();
       if (d == null) return [];
-      final dir = Directory('${d.path}/Recordings');
-      if (!dir.existsSync()) return [];
-      return dir.listSync().where((f) => f.path.endsWith('.mp4')).toList()
+      final fb = Directory('${d.path}/WIESPL_Recordings');
+      if (!fb.existsSync()) return [];
+      return fb
+          .listSync(recursive: true)
+          .where((f) => f.path.endsWith('.mp4'))
+          .toList()
         ..sort((a, b) => b.path.compareTo(a.path));
     } catch (_) {
       return [];
     }
   }
 
-  // ── Format helpers ──────────────────────────────────────────────────────
+  // ── Format helpers ───────────────────────────────────────────────────────
   String fmtDur(int idx) {
     final st = slots[idx].startTime.value;
     if (st == null) return '00:00';

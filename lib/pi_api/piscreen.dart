@@ -231,17 +231,26 @@ class Report {
 // ==================== API SERVICE ====================
 
 class ApiService {
-  // Remove hardcoded IP and use SharedPreferences
-  static String baseUrl = 'http://192.168.1.132:3000/api'; // Default fallback
+  static String baseUrl = 'http://192.168.0.137:3000/api'; // Default fallback
 
   // Initialize baseUrl from SharedPreferences
   static Future<void> initializeBaseUrl() async {
     final prefs = await SharedPreferences.getInstance();
     final patientSystemIp = prefs.getString('patientSystemIp');
     if (patientSystemIp != null && patientSystemIp.isNotEmpty) {
-      baseUrl = 'http://192.168.0.139:3000/api';
+      // Use the saved IP from SharedPreferences
+      baseUrl = 'http://$patientSystemIp:3000/api';
+    } else {
+      // Keep the default fallback if no IP is saved
+      baseUrl = 'http://192.168.1.132:3000/api';
     }
-    // If patientSystemIp is not set, it will use the default fallback
+  }
+
+  // Method to update the IP dynamically
+  static Future<void> updateBaseUrl(String newIp) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('patientSystemIp', newIp);
+    baseUrl = 'http://$newIp:3000/api';
   }
 
   // Handle API errors
@@ -587,6 +596,10 @@ class _PatientListScreenState extends State<PatientListScreen> {
     final patientSystemIp = prefs.getString('patientSystemIp');
     setState(() {
       _currentIp = patientSystemIp ?? 'Not configured';
+      // Also update the ApiService baseUrl
+      if (patientSystemIp != null && patientSystemIp.isNotEmpty) {
+        ApiService.baseUrl = 'http://$patientSystemIp:3000/api';
+      }
     });
   }
 
@@ -651,6 +664,81 @@ class _PatientListScreenState extends State<PatientListScreen> {
         ).showSnackBar(SnackBar(content: Text('Error deleting patient: $e')));
       }
     }
+  }
+
+  void _showIpConfigurationDialog() {
+    final ipController = TextEditingController(
+      text: _currentIp == 'Not configured' ? '' : _currentIp,
+    );
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Configure Server IP'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Enter the IP address of the patient server:',
+              style: TextStyle(fontSize: 14),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: ipController,
+              decoration: InputDecoration(
+                labelText: 'Server IP',
+                hintText: '192.168.1.132',
+                prefixIcon: const Icon(Icons.dns),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              keyboardType: TextInputType.number,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Note: The server uses port 3000',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              final newIp = ipController.text.trim();
+              if (newIp.isNotEmpty) {
+                // Save and update the IP
+                await ApiService.updateBaseUrl(newIp);
+                setState(() {
+                  _currentIp = newIp;
+                });
+                // Reload patients with new IP
+                await _checkServerStatus();
+                await _loadPatients();
+                if (mounted) {
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Server IP updated to: $newIp'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                }
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF2196F3),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Save & Test'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showAddPatientDialog() {
@@ -934,15 +1022,19 @@ class _PatientListScreenState extends State<PatientListScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      //       static const Color _primaryColor = Color.fromARGB(255, 44, 16, 90);
-      // static const Color _accentColor = Color.fromARGB(255, 68, 49, 127);
       backgroundColor: const Color.fromARGB(255, 44, 16, 90),
       appBar: AppBar(
         title: const Text('Hospital Patients'),
-        backgroundColor: Color.fromARGB(255, 44, 16, 90),
+        backgroundColor: const Color.fromARGB(255, 44, 16, 90),
         foregroundColor: Colors.white,
         elevation: 0,
         actions: [
+          // Add IP configuration button
+          IconButton(
+            icon: const Icon(Icons.settings_ethernet),
+            onPressed: _showIpConfigurationDialog,
+            tooltip: 'Configure Server IP',
+          ),
           // Show current IP configuration
           Tooltip(
             message: 'Server IP: $_currentIp',
@@ -1088,8 +1180,6 @@ class _PatientListScreenState extends State<PatientListScreen> {
     );
   }
 }
-
-// ==================== PATIENT DETAIL SCREEN ====================
 
 // ==================== PATIENT DETAIL SCREEN ====================
 

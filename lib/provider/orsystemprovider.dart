@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
-
+import 'package:image_picker/image_picker.dart';
 import 'dart:async';
-
+import 'dart:convert';
 import 'package:intl/intl.dart';
-import 'package:audioplayers/audioplayers.dart'; // FIX: switched from just_audio to audioplayers
+import 'package:audioplayers/audioplayers.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wiespl_contrl_panel/main.dart';
+import 'package:http_parser/http_parser.dart'; // ADD
+// REMOVE THIS - it's already defined in main.dart
+// enum ORViewMode { dashboard, orMode }
 
 class ORSystemProvider extends ChangeNotifier {
   bool _isSystemOn = true;
@@ -25,49 +30,72 @@ class ORSystemProvider extends ChangeNotifier {
   Timer? _stopwatchTimer;
   bool _timerRunning = false;
 
+  // Music Player State
   bool _isMusicPlaying = false;
   int _currentTrackIndex = 0;
   Duration _currentPosition = Duration.zero;
 
-  // FIX: use AudioPlayer from audioplayers package
+  // Tab selection: 0 = Server Music, 1 = Asset Music
+  int _musicTabIndex = 0;
+
+  // Server configuration
+  String _serverUrl = 'http://192.168.0.137:3000';
+
+  // Server music list
+  List<Map<String, dynamic>> _serverMusicList = [];
+  bool _isLoadingServerMusic = false;
+
   final AudioPlayer _audioPlayer = AudioPlayer();
 
-  // FIX: use AssetSource paths — same format as the working example
-  final List<Map<String, dynamic>> _playlist = [
-    {"title": "He Ram He Ram", "asset": "music/He Ram He Ram-320kbps.mp3"},
+  // Asset playlist (built-in music)
+  final List<Map<String, dynamic>> _assetPlaylist = [
+    {
+      "title": "He Ram He Ram",
+      "asset": "music/He Ram He Ram-320kbps.mp3",
+      "type": "asset",
+    },
     {
       "title": "Mahamrityunjay Mantra",
       "asset":
           "music/Mahamrityunjay Mantra महमतयजय मतर Om Trayambakam Yajamahe.mp3",
+      "type": "asset",
     },
     {
       "title": "Shiv Namaskarartha Mantra",
       "asset":
           "music/Shiv Namaskarartha Mantra  Monday Special  LoFi Version.mp3",
+      "type": "asset",
     },
     {
       "title": "Sri Venkatesha Stotram",
       "asset":
           "music/Sri Venkatesha Stotram - Invoking the Lord's Mercy _ New Year 2025.mp3",
+      "type": "asset",
     },
     {
       "title": "Sri Venkateshwara Suprabhatham",
       "asset": "music/Sri Venkateshwara Suprabhatham-320kbps.mp3",
+      "type": "asset",
     },
     {
       "title": "Hanuman Chalisa",
       "asset":
           "music/शर हनमन चलस  Shree Hanuman Chalisa Original Video  GULSHAN KUMAR  HARIHARAN Full HD.mp3",
+      "type": "asset",
     },
   ];
 
   ORSystemProvider() {
+    _initProvider();
+  }
+
+  Future<void> _initProvider() async {
+    await _loadServerUrl();
     Timer.periodic(const Duration(seconds: 1), (t) {
       _now = DateTime.now();
       notifyListeners();
     });
 
-    // FIX: audioplayers event listeners (different API from just_audio)
     _audioPlayer.onPositionChanged.listen((position) {
       _currentPosition = position;
       notifyListeners();
@@ -78,7 +106,6 @@ class ORSystemProvider extends ChangeNotifier {
       notifyListeners();
     });
 
-    // Auto-advance to next track when current one finishes
     _audioPlayer.onPlayerComplete.listen((event) {
       _isMusicPlaying = false;
       _currentPosition = Duration.zero;
@@ -86,7 +113,15 @@ class ORSystemProvider extends ChangeNotifier {
     });
   }
 
-  // Getters
+  Future<void> _loadServerUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ip = prefs.getString('storeManagementIp');
+    if (ip != null && ip.isNotEmpty) {
+      _serverUrl = 'http://$ip:3000';
+    }
+  }
+
+  // ==================== GETTERS ====================
   bool get isSystemOn => _isSystemOn;
   double get temp => _temp;
   double get rh => _rh;
@@ -100,7 +135,29 @@ class ORSystemProvider extends ChangeNotifier {
   bool get showMGPSFlip => _showMGPSFlip;
   bool get isMusicPlaying => _isMusicPlaying;
   ORViewMode get viewMode => _viewMode;
-  String get currentTrack => _playlist[_currentTrackIndex]["title"];
+  int get musicTabIndex => _musicTabIndex;
+  int get currentTrackIndex => _currentTrackIndex;
+  Duration get currentPosition => _currentPosition;
+  String get serverUrl => _serverUrl;
+  List<Map<String, dynamic>> get serverMusicList => _serverMusicList;
+  bool get isLoadingServerMusic => _isLoadingServerMusic;
+
+  List<Map<String, dynamic>> get currentPlaylist {
+    return _musicTabIndex == 0 ? _serverMusicList : _assetPlaylist;
+  }
+
+  String get currentTrack {
+    final playlist = currentPlaylist;
+    if (playlist.isEmpty || _currentTrackIndex >= playlist.length) {
+      return 'No track selected';
+    }
+    return playlist[_currentTrackIndex]['title'] ??
+        playlist[_currentTrackIndex]['name'] ??
+        'Unknown';
+  }
+
+  bool get isCurrentTrackServer => _musicTabIndex == 0;
+
   String get formattedFullDate =>
       DateFormat('EEEE, dd/MM/yyyy').format(_now).toUpperCase();
 
@@ -110,6 +167,146 @@ class ORSystemProvider extends ChangeNotifier {
     return "${twoDigits(d.inMinutes)}:${twoDigits(d.inSeconds % 60)}";
   }
 
+  // ==================== SERVER MUSIC METHODS ====================
+
+  Future<void> fetchServerMusic() async {
+    _isLoadingServerMusic = true;
+    notifyListeners();
+
+    try {
+      final response = await http
+          .get(Uri.parse('$_serverUrl/api/music'))
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        if (data is List) {
+          _serverMusicList = data.map((item) {
+            return {
+              'id': item['id'] ?? 0,
+              'title': item['name'] ?? 'Unknown',
+              'name': item['name'] ?? 'Unknown',
+              'filename': item['filename'] ?? '',
+              'url': '$_serverUrl/uploads/music/${item['filename']}',
+              'file_size': item['file_size'] ?? 0,
+              'type': 'server',
+            };
+          }).toList();
+        }
+      }
+    } catch (e) {
+      debugPrint('Error fetching server music: $e');
+    }
+
+    _isLoadingServerMusic = false;
+    notifyListeners();
+  }
+
+  Future<void> deleteServerMusic(int id) async {
+    try {
+      final response = await http.delete(
+        Uri.parse('$_serverUrl/api/music/$id'),
+      );
+
+      if (response.statusCode == 200) {
+        _serverMusicList.removeWhere((m) => m['id'] == id);
+
+        if (_musicTabIndex == 0 &&
+            _currentTrackIndex < _serverMusicList.length &&
+            _serverMusicList.isNotEmpty &&
+            _serverMusicList[_currentTrackIndex]['id'] == id) {
+          await _audioPlayer.stop();
+          _isMusicPlaying = false;
+          _currentPosition = Duration.zero;
+        }
+        notifyListeners();
+      }
+    } catch (e) {
+      debugPrint('Error deleting music: $e');
+    }
+  }
+
+  // ==================== MUSIC CONTROLS ====================
+
+  void setMusicTab(int index) {
+    _musicTabIndex = index;
+    if (index == 0 && _serverMusicList.isEmpty) {
+      fetchServerMusic();
+    }
+    notifyListeners();
+  }
+
+  Future<void> togglePlayPause() async {
+    final playlist = currentPlaylist;
+    if (playlist.isEmpty) return;
+
+    if (_isMusicPlaying) {
+      await _audioPlayer.pause();
+    } else {
+      if (_currentPosition.inSeconds > 0) {
+        await _audioPlayer.resume();
+      } else {
+        await _playCurrentTrack();
+      }
+    }
+  }
+
+  Future<void> _playCurrentTrack() async {
+    try {
+      final playlist = currentPlaylist;
+      if (playlist.isEmpty || _currentTrackIndex >= playlist.length) return;
+
+      final track = playlist[_currentTrackIndex];
+      await _audioPlayer.stop();
+      _currentPosition = Duration.zero;
+
+      if (track['type'] == 'server') {
+        debugPrint("▶ Playing server: ${track['url']}");
+        await _audioPlayer.play(UrlSource(track['url']));
+      } else {
+        debugPrint("▶ Playing asset: ${track['asset']}");
+        await _audioPlayer.play(AssetSource(track['asset']));
+      }
+    } catch (e) {
+      debugPrint("Audio Error: $e");
+    }
+  }
+
+  void playTrackAtIndex(int index) {
+    final playlist = currentPlaylist;
+    if (index >= 0 && index < playlist.length) {
+      _currentTrackIndex = index;
+      _playCurrentTrack();
+    }
+  }
+
+  void nextTrack() {
+    final playlist = currentPlaylist;
+    if (playlist.isEmpty) return;
+
+    _currentTrackIndex = (_currentTrackIndex + 1) % playlist.length;
+    _playCurrentTrack();
+  }
+
+  void prevTrack() {
+    final playlist = currentPlaylist;
+    if (playlist.isEmpty) return;
+
+    _currentTrackIndex = (_currentTrackIndex - 1 < 0)
+        ? playlist.length - 1
+        : _currentTrackIndex - 1;
+    _playCurrentTrack();
+  }
+
+  Future<void> stopMusic() async {
+    await _audioPlayer.stop();
+    _isMusicPlaying = false;
+    _currentPosition = Duration.zero;
+    notifyListeners();
+  }
+
+  // ==================== UI TOGGLES ====================
+
   void setViewMode(ORViewMode mode) {
     _viewMode = mode;
     notifyListeners();
@@ -117,12 +314,78 @@ class ORSystemProvider extends ChangeNotifier {
 
   void toggleMusicFlip() {
     _showMusic = !_showMusic;
+    if (_showMusic && _serverMusicList.isEmpty) {
+      fetchServerMusic();
+    }
     notifyListeners();
   }
 
   void toggleTempFlip() {
     _showTempSettings = !_showTempSettings;
     notifyListeners();
+  }
+  // ==================== UPLOAD MUSIC ====================
+
+  Future<void> uploadMusic() async {
+    try {
+      // Use image_picker to pick media files
+      final ImagePicker picker = ImagePicker();
+      final XFile? file = await picker.pickMedia();
+
+      if (file == null) return;
+
+      final bytes = await file.readAsBytes();
+      String fileName = file.name;
+
+      // Force .mp3 extension
+      if (!fileName.toLowerCase().endsWith('.mp3')) {
+        fileName = '${fileName.split('.').first}.mp3';
+      }
+
+      if (bytes.length > 60 * 1024 * 1024) {
+        debugPrint('File too large (max 60MB)');
+        return;
+      }
+
+      // Show name dialog
+      String? musicName = await _showMusicNameDialog(fileName);
+
+      if (musicName == null || musicName.isEmpty) return;
+
+      // Upload to server
+      var request = http.MultipartRequest(
+        'POST',
+        Uri.parse('$_serverUrl/api/music'),
+      );
+      request.fields['name'] = musicName;
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          'music',
+          bytes,
+          filename: fileName,
+          contentType: MediaType('audio', 'mpeg'),
+        ),
+      );
+
+      final response = await request.send();
+
+      if (response.statusCode == 200) {
+        debugPrint('Upload successful');
+        // Refresh the music list
+        await fetchServerMusic();
+      } else {
+        debugPrint('Upload failed: ${response.statusCode}');
+      }
+    } catch (e) {
+      debugPrint('Upload error: $e');
+    }
+  }
+
+  Future<String?> _showMusicNameDialog(String defaultName) async {
+    // Since this is in provider, we need a BuildContext
+    // You can pass context from the widget or use a global navigator key
+    // For simplicity, return default name without extension
+    return defaultName.split('.').first;
   }
 
   void toggleHumidityFlip() {
@@ -150,44 +413,6 @@ class ORSystemProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  // FIX: togglePlayPause using audioplayers API (resume/pause/play)
-  Future<void> togglePlayPause() async {
-    if (_isMusicPlaying) {
-      await _audioPlayer.pause();
-    } else {
-      if (_currentPosition.inSeconds > 0) {
-        await _audioPlayer.resume(); // resume from paused position
-      } else {
-        await _playCurrentTrack(); // start fresh
-      }
-    }
-  }
-
-  // FIX: plays using AssetSource — exactly like the working example
-  Future<void> _playCurrentTrack() async {
-    try {
-      final assetPath = _playlist[_currentTrackIndex]["asset"] as String;
-      debugPrint("▶ Playing: $assetPath");
-      await _audioPlayer.stop();
-      _currentPosition = Duration.zero;
-      await _audioPlayer.play(AssetSource(assetPath));
-    } catch (e) {
-      debugPrint("Audio Error: $e");
-    }
-  }
-
-  void nextTrack() {
-    _currentTrackIndex = (_currentTrackIndex + 1) % _playlist.length;
-    _playCurrentTrack();
-  }
-
-  void prevTrack() {
-    _currentTrackIndex = (_currentTrackIndex - 1 < 0)
-        ? _playlist.length - 1
-        : _currentTrackIndex - 1;
-    _playCurrentTrack();
-  }
-
   void toggleSystem() {
     _isSystemOn = !_isSystemOn;
     if (!_isSystemOn) {
@@ -201,6 +426,8 @@ class ORSystemProvider extends ChangeNotifier {
     _lights[index] = !_lights[index];
     notifyListeners();
   }
+
+  // ==================== STOPWATCH ====================
 
   void toggleStopwatch() {
     _timerRunning = !_timerRunning;
@@ -221,6 +448,8 @@ class ORSystemProvider extends ChangeNotifier {
     _stopwatchTimer?.cancel();
     notifyListeners();
   }
+
+  // ==================== DISPOSE ====================
 
   @override
   void dispose() {

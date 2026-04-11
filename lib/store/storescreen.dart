@@ -166,14 +166,26 @@ class Order {
 // ==================== API SERVICE ====================
 
 class ApiService {
-  static String baseUrl = 'http://192.168.1.133:3000/api';
+  static String baseUrl = 'http://192.168.1.133:3000/api'; // Default fallback
 
+  // Initialize baseUrl from SharedPreferences
   static Future<void> initializeBaseUrl() async {
     final prefs = await SharedPreferences.getInstance();
-    final storeManagementIp = prefs.getString('storeManagementIp');
+    final storeManagementIp = prefs.getString('store_management_ip');
     if (storeManagementIp != null && storeManagementIp.isNotEmpty) {
-      baseUrl = 'http://192.168.1.133:3000:3000/api';
+      // Use the saved IP from SharedPreferences
+      baseUrl = 'http://$storeManagementIp:3000/api';
+    } else {
+      // Keep the default fallback if no IP is saved
+      baseUrl = 'http://192.168.1.133:3000/api';
     }
+  }
+
+  // Method to update the IP dynamically
+  static Future<void> updateBaseUrl(String newIp) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('store_management_ip', newIp);
+    baseUrl = 'http://$newIp:3000/api';
   }
 
   void _handleError(http.Response response) {
@@ -297,10 +309,84 @@ class _StoreHomeScreenState extends State<StoreHomeScreen>
 
   Future<void> _loadCurrentIp() async {
     final prefs = await SharedPreferences.getInstance();
-    final storeManagementIp = prefs.getString('storeManagementIp');
+    final storeManagementIp = prefs.getString('store_management_ip');
     setState(() {
       _currentIp = storeManagementIp ?? 'Not configured';
     });
+  }
+
+  void _showIpConfigurationDialog() {
+    final ipController = TextEditingController(
+      text: _currentIp == 'Not configured' ? '' : _currentIp,
+    );
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Configure Server IP'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Enter the IP address of the store server:',
+              style: TextStyle(fontSize: 14),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: ipController,
+              decoration: InputDecoration(
+                labelText: 'Server IP',
+                hintText: '192.168.1.133',
+                prefixIcon: const Icon(Icons.dns),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              keyboardType: TextInputType.number,
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Note: The server uses port 3000',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              final newIp = ipController.text.trim();
+              if (newIp.isNotEmpty) {
+                // Save and update the IP
+                await ApiService.updateBaseUrl(newIp);
+                setState(() {
+                  _currentIp = newIp;
+                });
+                // Reload with new IP
+                await _checkServerStatus();
+                if (mounted) {
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Server IP updated to: $newIp'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                }
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF2196F3),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Save & Test'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _checkServerStatus() async {
@@ -313,13 +399,21 @@ class _StoreHomeScreenState extends State<StoreHomeScreen>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF3D8A8F),
+      //   static const Color _primaryColor = Color.fromARGB(255, 44, 16, 90);
+      // static const Color _accentColor =
+      backgroundColor: Color.fromARGB(255, 68, 49, 127),
       appBar: AppBar(
         title: const Text('Hospital Store'),
-        backgroundColor: const Color(0xFF3D8A8F),
+        backgroundColor: Color.fromARGB(255, 44, 16, 90),
         foregroundColor: Colors.white,
         elevation: 0,
         actions: [
+          // Add IP configuration button
+          IconButton(
+            icon: const Icon(Icons.settings_ethernet),
+            onPressed: _showIpConfigurationDialog,
+            tooltip: 'Configure Server IP',
+          ),
           Tooltip(
             message: 'Server IP: $_currentIp',
             child: IconButton(
@@ -396,20 +490,19 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
   String _searchQuery = '';
   String _selectedCategory = 'All';
   String _currentIp = '';
-  String _otNumber = ''; // Add OT number variable
-  bool _useDemoData = false;
+  String _otNumber = '';
 
   @override
   void initState() {
     super.initState();
     _loadCurrentIp();
-    _loadOtNumber(); // Load OT number
+    _loadOtNumber();
     _loadItems();
   }
 
   Future<void> _loadCurrentIp() async {
     final prefs = await SharedPreferences.getInstance();
-    final storeManagementIp = prefs.getString('storeManagementIp');
+    final storeManagementIp = prefs.getString('store_management_ip');
     setState(() {
       _currentIp = storeManagementIp ?? 'Not configured';
     });
@@ -424,140 +517,13 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
     print("=== DEBUG: Loaded OT Number: $_otNumber ===");
   }
 
-  List<StoreItem> _getDemoItems() {
-    return [
-      StoreItem(
-        id: 1,
-        name: 'Paracetamol 500mg',
-        category: 'Medicines',
-        quantity: 150,
-        minStock: 50,
-        price: 2.50,
-      ),
-      StoreItem(
-        id: 2,
-        name: 'Surgical Gloves (Box of 100)',
-        category: 'Disposables',
-        quantity: 25,
-        minStock: 30,
-        price: 15.00,
-      ),
-      StoreItem(
-        id: 3,
-        name: 'Syringe 5ml (Box of 100)',
-        category: 'Disposables',
-        quantity: 8,
-        minStock: 20,
-        price: 12.00,
-      ),
-      StoreItem(
-        id: 4,
-        name: 'Gauze Roll 10cm',
-        category: 'Dressings',
-        quantity: 45,
-        minStock: 40,
-        price: 3.75,
-      ),
-      StoreItem(
-        id: 5,
-        name: 'Adhesive Tape 2.5cm',
-        category: 'Dressings',
-        quantity: 60,
-        minStock: 30,
-        price: 2.25,
-      ),
-      StoreItem(
-        id: 6,
-        name: 'BP Apparatus',
-        category: 'Equipment',
-        quantity: 5,
-        minStock: 8,
-        price: 85.00,
-      ),
-      StoreItem(
-        id: 7,
-        name: 'Stethoscope',
-        category: 'Equipment',
-        quantity: 12,
-        minStock: 10,
-        price: 45.00,
-      ),
-      StoreItem(
-        id: 8,
-        name: 'N95 Mask (Box of 20)',
-        category: 'PPE',
-        quantity: 0,
-        minStock: 15,
-        price: 25.00,
-      ),
-      StoreItem(
-        id: 9,
-        name: 'Surgical Gown (Pack of 10)',
-        category: 'PPE',
-        quantity: 18,
-        minStock: 20,
-        price: 45.00,
-      ),
-      StoreItem(
-        id: 10,
-        name: 'Amoxicillin 250mg',
-        category: 'Medicines',
-        quantity: 200,
-        minStock: 60,
-        price: 3.00,
-      ),
-      StoreItem(
-        id: 11,
-        name: 'IV Cannula 22G (Box of 50)',
-        category: 'Disposables',
-        quantity: 12,
-        minStock: 25,
-        price: 28.00,
-      ),
-      StoreItem(
-        id: 12,
-        name: 'Bandage Elastic 4"',
-        category: 'Dressings',
-        quantity: 35,
-        minStock: 30,
-        price: 4.50,
-      ),
-      StoreItem(
-        id: 13,
-        name: 'Pulse Oximeter',
-        category: 'Equipment',
-        quantity: 6,
-        minStock: 8,
-        price: 32.00,
-      ),
-      StoreItem(
-        id: 14,
-        name: 'Face Shield',
-        category: 'PPE',
-        quantity: 22,
-        minStock: 25,
-        price: 8.00,
-      ),
-      StoreItem(
-        id: 15,
-        name: 'Ibuprofen 400mg',
-        category: 'Medicines',
-        quantity: 85,
-        minStock: 40,
-        price: 2.75,
-      ),
-    ];
-  }
-
   Future<void> _loadItems() async {
     setState(() {
       _isLoading = true;
       _error = '';
-      _useDemoData = false;
     });
 
     try {
-      // Try to get from API first
       final items = await widget.apiService.getStoreItems();
       setState(() {
         _items = items;
@@ -565,14 +531,9 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
         _isLoading = false;
       });
     } catch (e) {
-      // Fallback to demo data if server is offline
-      print('Using demo data - server offline');
       setState(() {
-        _items = _getDemoItems();
-        _filteredItems = _items;
         _isLoading = false;
-        _useDemoData = true;
-        _error = 'Using demo data (server offline)';
+        _error = 'Failed to load items: ${e.toString()}';
       });
     }
   }
@@ -720,8 +681,6 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
   void _showOrderDialog(StoreItem item) {
     final quantityController = TextEditingController(text: '1');
     String selectedUrgency = 'medium';
-
-    // Use the OT number from SharedPreferences
     String selectedOT = _otNumber;
 
     showDialog(
@@ -744,7 +703,6 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
                   keyboardType: TextInputType.number,
                 ),
                 const SizedBox(height: 16),
-                // Display OT number (read-only)
                 TextFormField(
                   initialValue: selectedOT,
                   decoration: InputDecoration(
@@ -852,30 +810,12 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
                     createdAt: DateTime.now().toIso8601String().split('T')[0],
                   );
 
-                  if (_useDemoData) {
-                    // Simulate order creation in demo mode
-                    await Future.delayed(const Duration(milliseconds: 500));
-                    // ignore: use_build_context_synchronously
-                    Navigator.of(context).pop();
-                    // ignore: use_build_context_synchronously
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(
-                        content: Text(
-                          'Demo: Order placed for ${item.name} (Server offline)',
-                        ),
-                      ),
-                    );
-                  } else {
-                    await widget.apiService.createOrder(order);
-                    // ignore: use_build_context_synchronously
-                    Navigator.of(context).pop();
-                    // ignore: use_build_context_synchronously
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Order placed for ${item.name}')),
-                    );
-                  }
+                  await widget.apiService.createOrder(order);
+                  Navigator.of(context).pop();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Order placed for ${item.name}')),
+                  );
 
-                  // Update local stock
                   final updatedItem = StoreItem(
                     id: item.id,
                     name: item.name,
@@ -893,7 +833,6 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
                     _filterItems();
                   });
                 } catch (e) {
-                  // ignore: use_build_context_synchronously
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(content: Text('Error placing order: $e')),
                   );
@@ -911,7 +850,6 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        // Show OT number at the top
         Container(
           width: double.infinity,
           padding: const EdgeInsets.all(8),
@@ -945,20 +883,6 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
           ),
         ),
 
-        // Demo Mode Indicator
-        if (_useDemoData)
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(4),
-            color: Colors.orange.withOpacity(0.2),
-            child: const Text(
-              '⚠️ Demo Mode - Using Sample Data',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.orange, fontSize: 12),
-            ),
-          ),
-
-        // Search and Filter Bar
         Padding(
           padding: const EdgeInsets.all(8.0),
           child: Column(
@@ -1037,7 +961,6 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
           ),
         ),
 
-        // Statistics
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16.0),
           child: Row(
@@ -1068,11 +991,10 @@ class _StoreInventoryScreenState extends State<StoreInventoryScreen> {
 
         const SizedBox(height: 8),
 
-        // Items List
         Expanded(
           child: _isLoading
               ? const Center(child: CircularProgressIndicator())
-              : _error.isNotEmpty && !_useDemoData
+              : _error.isNotEmpty
               ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
@@ -1183,8 +1105,7 @@ class _OrdersScreenState extends State<OrdersScreen> {
   String _selectedStatus = 'All';
   String _selectedUrgency = 'All';
   String _currentIp = '';
-  String _otNumber = ''; // Add OT number variable
-  bool _useDemoData = false;
+  String _otNumber = '';
 
   String _capitalize(String text) {
     if (text.isEmpty) return text;
@@ -1230,13 +1151,13 @@ class _OrdersScreenState extends State<OrdersScreen> {
   void initState() {
     super.initState();
     _loadCurrentIp();
-    _loadOtNumber(); // Load OT number
+    _loadOtNumber();
     _loadOrders();
   }
 
   Future<void> _loadCurrentIp() async {
     final prefs = await SharedPreferences.getInstance();
-    final storeManagementIp = prefs.getString('storeManagementIp');
+    final storeManagementIp = prefs.getString('store_management_ip');
     setState(() {
       _currentIp = storeManagementIp ?? 'Not configured';
     });
@@ -1251,177 +1172,14 @@ class _OrdersScreenState extends State<OrdersScreen> {
     print("=== DEBUG: Loaded OT Number: $_otNumber ===");
   }
 
-  List<Order> _getDemoOrders() {
-    final today = DateTime.now();
-    final yesterday = today.subtract(const Duration(days: 1));
-    final twoDaysAgo = today.subtract(const Duration(days: 2));
-    final threeDaysAgo = today.subtract(const Duration(days: 3));
-
-    return [
-      Order(
-        id: 1,
-        itemId: 3,
-        itemName: 'Syringe 5ml (Box of 100)',
-        otName: _otNumber,
-        quantity: 2,
-        urgency: 'critical',
-        status: 'pending',
-        createdAt: today.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 2,
-        itemId: 1,
-        itemName: 'Paracetamol 500mg',
-        otName: _otNumber,
-        quantity: 50,
-        urgency: 'medium',
-        status: 'dispatched',
-        createdAt: yesterday.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 3,
-        itemId: 8,
-        itemName: 'N95 Mask (Box of 20)',
-        otName: _otNumber,
-        quantity: 3,
-        urgency: 'high',
-        status: 'completed',
-        createdAt: twoDaysAgo.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 4,
-        itemId: 4,
-        itemName: 'Gauze Roll 10cm',
-        otName: _otNumber,
-        quantity: 10,
-        urgency: 'medium',
-        status: 'completed',
-        createdAt: threeDaysAgo.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 5,
-        itemId: 11,
-        itemName: 'IV Cannula 22G (Box of 50)',
-        otName: _otNumber,
-        quantity: 1,
-        urgency: 'high',
-        status: 'pending',
-        createdAt: today.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 6,
-        itemId: 2,
-        itemName: 'Surgical Gloves (Box of 100)',
-        otName: _otNumber,
-        quantity: 3,
-        urgency: 'low',
-        status: 'dispatched',
-        createdAt: yesterday.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 7,
-        itemId: 9,
-        itemName: 'Surgical Gown (Pack of 10)',
-        otName: _otNumber,
-        quantity: 2,
-        urgency: 'medium',
-        status: 'pending',
-        createdAt: today.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 8,
-        itemId: 14,
-        itemName: 'Face Shield',
-        otName: _otNumber,
-        quantity: 5,
-        urgency: 'medium',
-        status: 'cancelled',
-        createdAt: twoDaysAgo.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 9,
-        itemId: 6,
-        itemName: 'BP Apparatus',
-        otName: _otNumber,
-        quantity: 1,
-        urgency: 'high',
-        status: 'completed',
-        createdAt: threeDaysAgo.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 10,
-        itemId: 13,
-        itemName: 'Pulse Oximeter',
-        otName: _otNumber,
-        quantity: 2,
-        urgency: 'critical',
-        status: 'dispatched',
-        createdAt: yesterday.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 11,
-        itemId: 5,
-        itemName: 'Adhesive Tape 2.5cm',
-        otName: _otNumber,
-        quantity: 8,
-        urgency: 'low',
-        status: 'pending',
-        createdAt: today.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 12,
-        itemId: 10,
-        itemName: 'Amoxicillin 250mg',
-        otName: _otNumber,
-        quantity: 30,
-        urgency: 'medium',
-        status: 'completed',
-        createdAt: twoDaysAgo.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 13,
-        itemId: 7,
-        itemName: 'Stethoscope',
-        otName: _otNumber,
-        quantity: 1,
-        urgency: 'high',
-        status: 'pending',
-        createdAt: today.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 14,
-        itemId: 12,
-        itemName: 'Bandage Elastic 4"',
-        otName: _otNumber,
-        quantity: 6,
-        urgency: 'medium',
-        status: 'dispatched',
-        createdAt: yesterday.toIso8601String().split('T')[0],
-      ),
-      Order(
-        id: 15,
-        itemId: 15,
-        itemName: 'Ibuprofen 400mg',
-        otName: _otNumber,
-        quantity: 40,
-        urgency: 'low',
-        status: 'pending',
-        createdAt: today.toIso8601String().split('T')[0],
-      ),
-    ];
-  }
-
   Future<void> _loadOrders() async {
     setState(() {
       _isLoading = true;
       _error = '';
-      _useDemoData = false;
     });
 
     try {
-      // Try to get from API first
       final orders = await widget.apiService.getOrders();
-      // Filter orders by current OT number
       final filteredOrders = orders
           .where((order) => order.otName == _otNumber)
           .toList();
@@ -1432,14 +1190,9 @@ class _OrdersScreenState extends State<OrdersScreen> {
         _isLoading = false;
       });
     } catch (e) {
-      // Fallback to demo data if server is offline
-      print('Using demo orders - server offline');
       setState(() {
-        _orders = _getDemoOrders();
-        _filteredOrders = _orders;
         _isLoading = false;
-        _useDemoData = true;
-        _error = 'Using demo data (server offline)';
+        _error = 'Failed to load orders: ${e.toString()}';
       });
     }
   }
@@ -1466,42 +1219,12 @@ class _OrdersScreenState extends State<OrdersScreen> {
 
   Future<void> _updateOrderStatus(Order order, String newStatus) async {
     try {
-      if (_useDemoData) {
-        // Simulate status update in demo mode
-        await Future.delayed(const Duration(milliseconds: 500));
-        final updatedOrder = Order(
-          id: order.id,
-          itemId: order.itemId,
-          itemName: order.itemName,
-          otName: order.otName,
-          quantity: order.quantity,
-          urgency: order.urgency,
-          status: newStatus,
-          createdAt: order.createdAt,
-        );
-
-        setState(() {
-          final index = _orders.indexWhere((o) => o.id == order.id);
-          if (index != -1) {
-            _orders[index] = updatedOrder;
-          }
-          _filterOrders();
-        });
-
-        // ignore: use_build_context_synchronously
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Demo: Order status updated to $newStatus')),
-        );
-      } else {
-        await widget.apiService.updateOrderStatus(order.id, newStatus);
-        // ignore: use_build_context_synchronously
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Order status updated to $newStatus')),
-        );
-        _loadOrders(); // Refresh orders
-      }
+      await widget.apiService.updateOrderStatus(order.id, newStatus);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Order status updated to $newStatus')),
+      );
+      _loadOrders();
     } catch (e) {
-      // ignore: use_build_context_synchronously
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Error updating order: $e')));
@@ -1531,29 +1254,12 @@ class _OrdersScreenState extends State<OrdersScreen> {
 
     if (confirmed == true) {
       try {
-        if (_useDemoData) {
-          // Simulate deletion in demo mode
-          await Future.delayed(const Duration(milliseconds: 500));
-          setState(() {
-            _orders.removeWhere((o) => o.id == order.id);
-            _filterOrders();
-          });
-          // ignore: use_build_context_synchronously
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Demo: Order deleted for ${order.itemName}'),
-            ),
-          );
-        } else {
-          await widget.apiService.deleteOrder(order.id);
-          // ignore: use_build_context_synchronously
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Order deleted for ${order.itemName}')),
-          );
-          _loadOrders(); // Refresh orders
-        }
+        await widget.apiService.deleteOrder(order.id);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Order deleted for ${order.itemName}')),
+        );
+        _loadOrders();
       } catch (e) {
-        // ignore: use_build_context_synchronously
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('Error deleting order: $e')));
@@ -1693,7 +1399,6 @@ class _OrdersScreenState extends State<OrdersScreen> {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        // Show OT number at the top
         Container(
           width: double.infinity,
           padding: const EdgeInsets.all(8),
@@ -1727,20 +1432,6 @@ class _OrdersScreenState extends State<OrdersScreen> {
           ),
         ),
 
-        // Demo Mode Indicator
-        if (_useDemoData)
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(4),
-            color: Colors.orange.withOpacity(0.2),
-            child: const Text(
-              '⚠️ Demo Mode - Using Sample Orders',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.orange, fontSize: 12),
-            ),
-          ),
-
-        // Filters
         Padding(
           padding: const EdgeInsets.all(8.0),
           child: Row(
@@ -1880,7 +1571,6 @@ class _OrdersScreenState extends State<OrdersScreen> {
           ),
         ),
 
-        // Statistics
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16.0),
           child: Row(
@@ -1917,11 +1607,10 @@ class _OrdersScreenState extends State<OrdersScreen> {
 
         const SizedBox(height: 8),
 
-        // Orders List
         Expanded(
           child: _isLoading
               ? const Center(child: CircularProgressIndicator())
-              : _error.isNotEmpty && !_useDemoData
+              : _error.isNotEmpty
               ? Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,

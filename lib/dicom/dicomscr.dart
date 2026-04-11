@@ -1,11 +1,16 @@
+// dicom_viewer_page.dart
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:path_provider/path_provider.dart';
-import 'dart:io';
-import 'dart:typed_data';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 // ── Channel name matches MainActivity.kt DICOM_CHANNEL ────────────────────────
 const _channel = MethodChannel('com.example.wiespl_contrl_panel/dicom');
@@ -54,6 +59,93 @@ class DicomImage {
     this.error,
     this.loadedAt,
   });
+}
+
+// ── Patient model from server ─────────────────────────────────────────────────
+class ServerPatient {
+  final String patientId;
+  final String name;
+  final String mrdNumber;
+  final String? age;
+  final String? gender;
+  final String? phone;
+  final List<PatientReport> reports;
+
+  ServerPatient({
+    required this.patientId,
+    required this.name,
+    required this.mrdNumber,
+    this.age,
+    this.gender,
+    this.phone,
+    this.reports = const [],
+  });
+
+  factory ServerPatient.fromJson(Map<String, dynamic> json) {
+    return ServerPatient(
+      patientId: json['patient_id']?.toString() ?? '',
+      name: json['name']?.toString() ?? 'Unknown',
+      mrdNumber: json['mrd_number']?.toString() ?? '',
+      age: json['age']?.toString(),
+      gender: json['gender']?.toString(),
+      phone: json['phone']?.toString(),
+    );
+  }
+
+  ServerPatient copyWith({List<PatientReport>? reports}) {
+    return ServerPatient(
+      patientId: patientId,
+      name: name,
+      mrdNumber: mrdNumber,
+      age: age,
+      gender: gender,
+      phone: phone,
+      reports: reports ?? this.reports,
+    );
+  }
+}
+
+// ── Report model ──────────────────────────────────────────────────────────────
+class PatientReport {
+  final int id;
+  final String patientId;
+  final String filename;
+  final String originalName;
+  final int? fileSize;
+  final String? fileType;
+  final String? uploadDate;
+  final String fileUrl;
+
+  PatientReport({
+    required this.id,
+    required this.patientId,
+    required this.filename,
+    required this.originalName,
+    this.fileSize,
+    this.fileType,
+    this.uploadDate,
+    required this.fileUrl,
+  });
+
+  factory PatientReport.fromJson(Map<String, dynamic> json, String baseUrl) {
+    return PatientReport(
+      id: json['id'] ?? 0,
+      patientId: json['patient_id']?.toString() ?? '',
+      filename: json['filename']?.toString() ?? '',
+      originalName: json['original_name']?.toString() ?? '',
+      fileSize: json['file_size'],
+      fileType: json['file_type']?.toString(),
+      uploadDate: json['upload_date']?.toString(),
+      fileUrl: '$baseUrl/uploads/patients/${json['filename']}',
+    );
+  }
+
+  bool get isImage => fileType?.startsWith('image/') ?? false;
+  bool get isPdf => fileType == 'application/pdf';
+  bool get isDicom {
+    final ext = originalName.split('.').last.toLowerCase();
+    return ext == 'dcm' || ext == 'dicom';
+  }
 }
 
 // ── Crosshair overlay painter ─────────────────────────────────────────────────
@@ -110,6 +202,19 @@ class DicomViewerPage extends StatefulWidget {
 
 class _DicomViewerPageState extends State<DicomViewerPage>
     with SingleTickerProviderStateMixin {
+  // Server connection
+  String _serverBaseUrl = '';
+  bool _serverConnected = false;
+  String _serverError = '';
+
+  // Patients data
+  List<ServerPatient> _patients = [];
+  List<ServerPatient> _filteredPatients = [];
+  String _searchQuery = '';
+  bool _loadingPatients = false;
+  ServerPatient? _selectedPatient;
+  bool _loadingReports = false;
+
   // Images
   final List<DicomImage> _images = [];
   int _selectedIndex = 0;
@@ -160,6 +265,9 @@ class _DicomViewerPageState extends State<DicomViewerPage>
       final scale = _transform.value.getMaxScaleOnAxis();
       if (mounted) setState(() => _currentZoom = scale);
     });
+
+    // Initialize server connection
+    _initServerConnection();
   }
 
   @override
@@ -379,7 +487,221 @@ class _DicomViewerPageState extends State<DicomViewerPage>
         : SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   }
 
-  // ── File picking ──────────────────────────────────────────────────────────
+  // ── Server Connection ─────────────────────────────────────────────────────
+  Future<void> _initServerConnection() async {
+    final prefs = await SharedPreferences.getInstance();
+    final patientSystemIP = prefs.getString('patient_system_ip') ?? '';
+
+    if (patientSystemIP.isEmpty) {
+      setState(() {
+        _serverError = 'No server IP configured. Please set patient_system_ip.';
+        _serverConnected = false;
+      });
+      return;
+    }
+
+    setState(() {
+      _serverBaseUrl = 'http://$patientSystemIP:3000';
+    });
+
+    await _testConnection();
+  }
+
+  Future<void> _testConnection() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$_serverBaseUrl/api/health'))
+          .timeout(const Duration(seconds: 5));
+
+      if (response.statusCode == 200) {
+        setState(() {
+          _serverConnected = true;
+          _serverError = '';
+        });
+        await _loadPatients();
+      } else {
+        setState(() {
+          _serverConnected = false;
+          _serverError = 'Server returned ${response.statusCode}';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _serverConnected = false;
+        _serverError = 'Cannot connect: $e';
+      });
+    }
+  }
+
+  // ── Load Patients from Server ─────────────────────────────────────────────
+  Future<void> _loadPatients() async {
+    if (!_serverConnected) return;
+
+    setState(() => _loadingPatients = true);
+
+    try {
+      final response = await http
+          .get(Uri.parse('$_serverBaseUrl/api/patients'))
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final List<dynamic> data = jsonDecode(response.body);
+        final patients = data.map((p) => ServerPatient.fromJson(p)).toList();
+
+        setState(() {
+          _patients = patients;
+          _filteredPatients = patients;
+          _loadingPatients = false;
+        });
+
+        _toast('Loaded ${patients.length} patients');
+      } else {
+        setState(() {
+          _loadingPatients = false;
+          _serverError = 'Failed to load patients';
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _loadingPatients = false;
+        _serverError = 'Error: $e';
+      });
+    }
+  }
+
+  // ── Load Reports for Selected Patient ─────────────────────────────────────
+  Future<void> _loadPatientReports(ServerPatient patient) async {
+    setState(() {
+      _selectedPatient = patient;
+      _loadingReports = true;
+    });
+
+    try {
+      final response = await http
+          .get(
+            Uri.parse(
+              '$_serverBaseUrl/api/patients/${patient.patientId}/reports',
+            ),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final List<dynamic> data = jsonDecode(response.body);
+        final reports = data
+            .map((r) => PatientReport.fromJson(r, _serverBaseUrl))
+            .toList();
+
+        setState(() {
+          _selectedPatient = patient.copyWith(reports: reports);
+          _loadingReports = false;
+        });
+
+        _toast('${reports.length} reports found');
+      } else {
+        setState(() => _loadingReports = false);
+      }
+    } catch (e) {
+      setState(() => _loadingReports = false);
+      _toast('Error loading reports');
+    }
+  }
+
+  // ── Open Report File (using file_picker for native file opening) ──────────
+  Future<void> _openReport(PatientReport report) async {
+    if (report.isDicom) {
+      await _downloadAndLoadDicom(report);
+    } else if (report.isImage || report.isPdf) {
+      await _openWithNativeViewer(report);
+    } else {
+      _toast('Unsupported file type: ${report.fileType}');
+    }
+  }
+
+  Future<void> _downloadAndLoadDicom(PatientReport report) async {
+    _toast('Downloading ${report.originalName}...');
+
+    try {
+      setState(() => _pickingFiles = true);
+
+      final response = await http.get(Uri.parse(report.fileUrl));
+      if (response.statusCode != 200) {
+        throw Exception('Failed to download');
+      }
+
+      final tempDir = Directory.systemTemp;
+      final tempFile = File('${tempDir.path}/${report.originalName}');
+      await tempFile.writeAsBytes(response.bodyBytes);
+
+      final newImage = DicomImage(
+        path: tempFile.path,
+        name: report.originalName,
+      );
+
+      setState(() {
+        _images.add(newImage);
+        _selectedIndex = _images.length - 1;
+        _loadingCount++;
+        _pickingFiles = false;
+      });
+
+      await _renderImage(newImage);
+      setState(() => _loadingCount = (_loadingCount - 1).clamp(0, 999));
+
+      _toast('DICOM loaded: ${report.originalName}');
+    } catch (e) {
+      setState(() => _pickingFiles = false);
+      _toast('Download failed: $e');
+    }
+  }
+
+  // Open non-DICOM files using url_launcher (opens in browser for PDFs/images)
+  Future<void> _openWithNativeViewer(PatientReport report) async {
+    try {
+      _toast('Opening ${report.originalName}...');
+
+      final response = await http.get(Uri.parse(report.fileUrl));
+      if (response.statusCode != 200) {
+        throw Exception('Failed to download');
+      }
+
+      final tempDir = await getTemporaryDirectory();
+      final tempFile = File('${tempDir.path}/${report.originalName}');
+      await tempFile.writeAsBytes(response.bodyBytes);
+
+      // Use file_picker to open the file natively
+      final result = await FilePicker.platform.pickFiles();
+
+      if (result != null) {
+        final file = result.files.single;
+        print(file.path);
+      }
+
+      if (result == null) {
+        // Fallback to URL launcher
+        await launchUrl(Uri.parse(report.fileUrl));
+      }
+    } catch (e) {
+      _toast('Cannot open file: $e');
+    }
+  }
+
+  // ── Search Patients ───────────────────────────────────────────────────────
+  void _searchPatients(String query) {
+    setState(() {
+      _searchQuery = query;
+      if (query.isEmpty) {
+        _filteredPatients = _patients;
+      } else {
+        _filteredPatients = _patients.where((p) {
+          return p.name.toLowerCase().contains(query.toLowerCase()) ||
+              p.mrdNumber.toLowerCase().contains(query.toLowerCase()) ||
+              (p.phone?.contains(query) ?? false);
+        }).toList();
+      }
+    });
+  }
+
+  // ── File picking (local) using file_picker ─────────────────────────────────
   Future<void> _pickFiles() async {
     setState(() => _pickingFiles = true);
     try {
@@ -688,6 +1010,9 @@ class _DicomViewerPageState extends State<DicomViewerPage>
             Expanded(
               child: Row(
                 children: [
+                  // Patient List Sidebar
+                  if (!_isFullscreen) _patientListSidebar(),
+                  // Thumbnail sidebar
                   if (_images.isNotEmpty && !_isFullscreen) _thumbnailSidebar(),
                   Expanded(
                     child: Column(
@@ -713,6 +1038,322 @@ class _DicomViewerPageState extends State<DicomViewerPage>
     );
   }
 
+  // ── Patient List Sidebar ──────────────────────────────────────────────────
+  Widget _patientListSidebar() {
+    return Container(
+      width: 280,
+      decoration: const BoxDecoration(
+        color: _surface,
+        border: Border(right: BorderSide(color: _border)),
+      ),
+      child: Column(
+        children: [
+          // Header
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: const BoxDecoration(
+              border: Border(bottom: BorderSide(color: _border)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.people_alt_outlined, color: _cyan, size: 18),
+                const SizedBox(width: 8),
+                const Text(
+                  'PATIENTS',
+                  style: TextStyle(
+                    color: _cyan,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+                const Spacer(),
+                // Connection status
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: _serverConnected ? Colors.green : Colors.red,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.refresh, color: _muted, size: 16),
+                  onPressed: _loadPatients,
+                  tooltip: 'Refresh',
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(
+                    minWidth: 24,
+                    minHeight: 24,
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Search bar
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: TextField(
+              style: const TextStyle(color: Colors.white, fontSize: 12),
+              decoration: InputDecoration(
+                hintText: 'Search name, MRD, phone...',
+                hintStyle: TextStyle(color: _dim, fontSize: 11),
+                prefixIcon: const Icon(Icons.search, color: _muted, size: 16),
+                filled: true,
+                fillColor: _card,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(6),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 8,
+                ),
+                isDense: true,
+              ),
+              onChanged: _searchPatients,
+            ),
+          ),
+
+          // Patient list
+          Expanded(
+            child: _loadingPatients
+                ? const Center(
+                    child: CircularProgressIndicator(
+                      color: _cyan,
+                      strokeWidth: 2,
+                    ),
+                  )
+                : _serverError.isNotEmpty
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.wifi_off, color: _red, size: 32),
+                          const SizedBox(height: 8),
+                          Text(
+                            _serverError,
+                            style: const TextStyle(color: _red, fontSize: 11),
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 12),
+                          ElevatedButton(
+                            onPressed: _initServerConnection,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: _cyan,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 8,
+                              ),
+                            ),
+                            child: const Text(
+                              'Retry',
+                              style: TextStyle(fontSize: 11),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    itemCount: _filteredPatients.length,
+                    itemBuilder: (_, i) => _patientCard(_filteredPatients[i]),
+                  ),
+          ),
+
+          // Selected patient reports panel
+          if (_selectedPatient != null) _reportsPanel(),
+        ],
+      ),
+    );
+  }
+
+  Widget _patientCard(ServerPatient patient) {
+    final isSelected = _selectedPatient?.patientId == patient.patientId;
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 6),
+      color: isSelected ? _cyan.withOpacity(0.1) : _card,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(8),
+        side: BorderSide(
+          color: isSelected ? _cyan : _border,
+          width: isSelected ? 1.5 : 1,
+        ),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: () => _loadPatientReports(patient),
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      patient.name,
+                      style: TextStyle(
+                        color: isSelected ? _cyan : Colors.white70,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 2,
+                    ),
+                    decoration: BoxDecoration(
+                      color: _border,
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                    child: Text(
+                      patient.mrdNumber,
+                      style: const TextStyle(color: _muted, fontSize: 9),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Row(
+                children: [
+                  if (patient.age != null) ...[
+                    Icon(Icons.person_outline, color: _dim, size: 10),
+                    const SizedBox(width: 3),
+                    Text(
+                      '${patient.age} yrs',
+                      style: TextStyle(color: _dim, fontSize: 9),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  if (patient.gender != null) ...[
+                    Icon(Icons.male, color: _dim, size: 10),
+                    const SizedBox(width: 3),
+                    Text(
+                      patient.gender!,
+                      style: TextStyle(color: _dim, fontSize: 9),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _reportsPanel() {
+    final patient = _selectedPatient!;
+
+    return Container(
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.of(context).size.height * 0.35,
+      ),
+      decoration: const BoxDecoration(
+        border: Border(top: BorderSide(color: _border)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(
+              children: [
+                const Icon(Icons.folder_open, color: _violet, size: 14),
+                const SizedBox(width: 6),
+                Text(
+                  'REPORTS (${patient.reports.length})',
+                  style: const TextStyle(
+                    color: _violet,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: 1,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  patient.name,
+                  style: const TextStyle(color: Colors.white38, fontSize: 9),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: _loadingReports
+                ? const Center(
+                    child: CircularProgressIndicator(
+                      color: _violet,
+                      strokeWidth: 2,
+                    ),
+                  )
+                : patient.reports.isEmpty
+                ? const Center(
+                    child: Text(
+                      'No reports found',
+                      style: TextStyle(color: _dim, fontSize: 10),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    itemCount: patient.reports.length,
+                    itemBuilder: (_, i) => _reportTile(patient.reports[i]),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _reportTile(PatientReport report) {
+    IconData icon;
+    Color iconColor;
+
+    if (report.isDicom) {
+      icon = Icons.medical_services;
+      iconColor = _cyan;
+    } else if (report.isPdf) {
+      icon = Icons.picture_as_pdf;
+      iconColor = _red;
+    } else if (report.isImage) {
+      icon = Icons.image;
+      iconColor = Colors.green;
+    } else {
+      icon = Icons.insert_drive_file;
+      iconColor = _muted;
+    }
+
+    final sizeText = report.fileSize != null
+        ? '${(report.fileSize! / 1024).toStringAsFixed(1)} KB'
+        : '';
+
+    return ListTile(
+      dense: true,
+      leading: Icon(icon, color: iconColor, size: 18),
+      title: Text(
+        report.originalName,
+        style: const TextStyle(color: Colors.white70, fontSize: 10),
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(
+        sizeText,
+        style: const TextStyle(color: _dim, fontSize: 8),
+      ),
+      trailing: const Icon(Icons.open_in_new, color: _muted, size: 14),
+      onTap: () => _openReport(report),
+    );
+  }
+
   // ── Top bar ───────────────────────────────────────────────────────────────
   Widget _topBar(DicomImage? cur) => Container(
     height: 52,
@@ -720,7 +1361,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
     padding: const EdgeInsets.symmetric(horizontal: 14),
     child: Row(
       children: [
-        // Back
         IconButton(
           icon: const Icon(
             Icons.arrow_back_ios_new,
@@ -733,8 +1373,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
           constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
         ),
         const SizedBox(width: 10),
-
-        // ── WIESPL DICOM logo ──────────────────────────────────────────
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
           decoration: BoxDecoration(
@@ -777,10 +1415,7 @@ class _DicomViewerPageState extends State<DicomViewerPage>
             ],
           ),
         ),
-
         const SizedBox(width: 14),
-
-        // File info
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -804,8 +1439,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
             ],
           ),
         ),
-
-        // Actions
         if (_images.isNotEmpty) ...[
           _iconBtn(Icons.delete_sweep_outlined, 'Clear All', _clearAll),
           const SizedBox(width: 6),
@@ -853,21 +1486,17 @@ class _DicomViewerPageState extends State<DicomViewerPage>
     padding: const EdgeInsets.symmetric(horizontal: 10),
     child: Row(
       children: [
-        // History
         _iconBtn(Icons.undo_rounded, 'Undo', _undo),
         _iconBtn(Icons.redo_rounded, 'Redo', _redo),
         _sep(),
-        // Zoom
         _iconBtn(Icons.zoom_in_rounded, 'Zoom In (+)', _zoomIn),
         _iconBtn(Icons.zoom_out_rounded, 'Zoom Out (−)', _zoomOut),
         _iconBtn(Icons.fit_screen_rounded, 'Fit to Screen (F)', _fitToScreen),
         _sep(),
-        // Transform
         _iconBtn(Icons.rotate_right_rounded, 'Rotate 90° (R)', _rotateImage),
         _iconBtn(Icons.flip_rounded, 'Flip Horizontal', _flipH),
         _iconBtn(Icons.flip_camera_android_rounded, 'Flip Vertical', _flipV),
         _sep(),
-        // Display
         _iconBtn(
           Icons.invert_colors_rounded,
           'Invert Colors (I)',
@@ -881,7 +1510,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
           active: _showWindowLevel,
         ),
         _sep(),
-        // Overlays
         _iconBtn(Icons.grid_on_rounded, 'Grid', _toggleGrid, active: _showGrid),
         _iconBtn(
           Icons.add_circle_outline_rounded,
@@ -890,7 +1518,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
           active: _showCrosshair,
         ),
         _sep(),
-        // Misc
         _iconBtn(Icons.info_outline_rounded, 'Image Info', _showImageInfo),
         _iconBtn(
           Icons.table_rows_rounded,
@@ -904,14 +1531,12 @@ class _DicomViewerPageState extends State<DicomViewerPage>
           _toggleFullscreen,
         ),
         _sep(),
-        // Export
         _iconBtn(Icons.ios_share_rounded, 'Share', _shareImage),
         _iconBtn(Icons.save_alt_rounded, 'Save PNG', _saveImage),
         if (_images.length > 1)
           _iconBtn(Icons.save_rounded, 'Batch Export', _batchExport),
         _iconBtn(Icons.refresh_rounded, 'Reset View (0)', _resetView),
         const Spacer(),
-        // Shortcut hint
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
           decoration: BoxDecoration(
@@ -1075,7 +1700,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
 
   // ── Viewport ──────────────────────────────────────────────────────────────
   Widget _viewport(DicomImage? cur) {
-    // Empty state
     if (_images.isEmpty) {
       return Center(
         child: Column(
@@ -1115,7 +1739,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
 
     if (cur == null) return const SizedBox.shrink();
 
-    // Loading
     if (cur.loading) {
       return const Center(
         child: Column(
@@ -1132,7 +1755,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
       );
     }
 
-    // Error
     if (cur.error != null) {
       return Center(
         child: Padding(
@@ -1176,13 +1798,11 @@ class _DicomViewerPageState extends State<DicomViewerPage>
       );
     }
 
-    // Image viewer
     return Container(
       color: Colors.black,
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // ── Main interactive image ──────────────────────────────────────
           InteractiveViewer(
             transformationController: _transform,
             minScale: 0.05,
@@ -1203,14 +1823,10 @@ class _DicomViewerPageState extends State<DicomViewerPage>
               ),
             ),
           ),
-
-          // ── Overlays ────────────────────────────────────────────────────
           if (_showCrosshair)
             IgnorePointer(child: CustomPaint(painter: _CrosshairPainter())),
           if (_showGrid)
             IgnorePointer(child: CustomPaint(painter: _GridPainter())),
-
-          // ── Patient / modality badge (top-left) ─────────────────────────
           if (cur.patientName.isNotEmpty || cur.modality.isNotEmpty)
             Positioned(
               top: 10,
@@ -1250,8 +1866,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
                 ),
               ),
             ),
-
-          // ── Zoom badge (top-right) ──────────────────────────────────────
           Positioned(
             top: 10,
             right: 10,
@@ -1271,8 +1885,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
               ),
             ),
           ),
-
-          // ── Navigation arrows ───────────────────────────────────────────
           if (_images.length > 1) ...[
             Positioned(
               left: 8,
@@ -1300,8 +1912,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
               ),
             ),
           ],
-
-          // ── Fullscreen toggle (bottom-right) ────────────────────────────
           Positioned(
             bottom: 10,
             right: 10,
@@ -1323,8 +1933,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
               ),
             ),
           ),
-
-          // ── Export overlay ──────────────────────────────────────────────
           if (_isExporting)
             Container(
               color: Colors.black54,
@@ -1579,7 +2187,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
     padding: const EdgeInsets.symmetric(horizontal: 12),
     child: Row(
       children: [
-        // Modality badge
         if (cur.modality.isNotEmpty)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
@@ -1599,16 +2206,12 @@ class _DicomViewerPageState extends State<DicomViewerPage>
             ),
           ),
         const SizedBox(width: 8),
-
-        // Image counter
         if (_images.length > 1)
           Text(
             '${_selectedIndex + 1} / ${_images.length}',
             style: const TextStyle(color: Colors.white38, fontSize: 9),
           ),
         const SizedBox(width: 8),
-
-        // Zoom
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
           decoration: BoxDecoration(
@@ -1624,8 +2227,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
             ),
           ),
         ),
-
-        // Filter badge
         if (_hasFilter) ...[
           const SizedBox(width: 6),
           Container(
@@ -1646,8 +2247,6 @@ class _DicomViewerPageState extends State<DicomViewerPage>
             ),
           ),
         ],
-
-        // Rotation angle
         if (_rotationAngle != 0) ...[
           const SizedBox(width: 6),
           Text(
@@ -1655,18 +2254,13 @@ class _DicomViewerPageState extends State<DicomViewerPage>
             style: const TextStyle(color: Colors.white38, fontSize: 9),
           ),
         ],
-
         const Spacer(),
-
-        // Institution
         if (cur.institution.isNotEmpty)
           Text(
             cur.institution,
             style: const TextStyle(color: _dim, fontSize: 9),
           ),
         const SizedBox(width: 10),
-
-        // Shortcut hint
         const Text(
           '← → navigate  •  +/− zoom  •  R rotate  •  F fit  •  I invert  •  W window  •  0 reset',
           style: TextStyle(color: _dim, fontSize: 8.5),

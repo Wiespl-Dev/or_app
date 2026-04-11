@@ -38,9 +38,31 @@ class _C {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
-class MedicalDashboard extends StatelessWidget {
+class MedicalDashboard extends StatefulWidget {
   final VoidCallback onLogout;
   const MedicalDashboard({super.key, required this.onLogout});
+
+  @override
+  State<MedicalDashboard> createState() => _MedicalDashboardState();
+}
+
+class _MedicalDashboardState extends State<MedicalDashboard> {
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeProviders();
+  }
+
+  Future<void> _initializeProviders() async {
+    // Get the providers and ensure they're initialized
+    final espPro = context.read<ESP32Provider>();
+    await espPro.init(); // This will load the saved IP
+    setState(() {
+      _isLoading = false;
+    });
+  }
 
   ScreenSize _screenSize(BuildContext context) {
     final w = MediaQuery.of(context).size.width;
@@ -51,6 +73,26 @@ class MedicalDashboard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(_C.teal),
+              ),
+              const SizedBox(height: 20),
+              Text(
+                'Loading ESP32 configuration...',
+                style: TextStyle(color: _C.darkText),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     final systemPro = context.watch<ORSystemProvider>();
 
     if (systemPro.viewMode == ORViewMode.orMode) return ORModeScreen();
@@ -66,7 +108,7 @@ class MedicalDashboard extends StatelessWidget {
               padding: const EdgeInsets.all(20),
               child: Column(
                 children: [
-                  _TopBar(systemPro: systemPro, onLogout: onLogout),
+                  _TopBar(systemPro: systemPro, onLogout: widget.onLogout),
                   const SizedBox(height: 10),
                   Expanded(
                     flex: 5,
@@ -102,7 +144,10 @@ class MedicalDashboard extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 15),
-                  _Footer(screenSize: _screenSize(context), onLogout: onLogout),
+                  _Footer(
+                    screenSize: _screenSize(context),
+                    onLogout: widget.onLogout,
+                  ),
                 ],
               ),
             ),
@@ -658,54 +703,291 @@ class _MusicBack extends StatelessWidget {
   const _MusicBack({required this.pro});
 
   @override
-  Widget build(BuildContext context) => Column(
-    mainAxisAlignment: MainAxisAlignment.center,
-    children: [
-      Icon(Icons.library_music, color: _C.teal, size: 30),
-      Padding(
-        padding: const EdgeInsets.all(8),
-        child: Text(
-          pro.currentTrack,
-          style: TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.w900,
-            color: _C.darkText,
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        // Tab Bar
+        Container(
+          margin: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.1),
+            borderRadius: BorderRadius.circular(20),
           ),
-          textAlign: TextAlign.center,
-        ),
-      ),
-      Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          IconButton(
-            icon: Icon(Icons.skip_previous, color: _C.teal),
-            onPressed: pro.prevTrack,
-          ),
-          CircleAvatar(
-            backgroundColor: _C.teal,
-            child: IconButton(
-              icon: Icon(
-                pro.isMusicPlaying ? Icons.pause : Icons.play_arrow,
-                color: Colors.white,
+          child: Row(
+            children: [
+              _MusicTabButton(
+                title: 'Server',
+                isSelected: pro.musicTabIndex == 0,
+                onTap: () => pro.setMusicTab(0),
               ),
-              onPressed: pro.togglePlayPause,
+              _MusicTabButton(
+                title: 'Default',
+                isSelected: pro.musicTabIndex == 1,
+                onTap: () => pro.setMusicTab(1),
+              ),
+            ],
+          ),
+        ),
+
+        // Upload Button (only for Server tab)
+        if (pro.musicTabIndex == 0)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            child: ElevatedButton.icon(
+              onPressed: () => _showUploadDialog(context, pro),
+              icon: const Icon(Icons.upload, size: 16),
+              label: const Text('Upload Music'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _C.teal,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(double.infinity, 36),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(20),
+                ),
+              ),
             ),
           ),
-          IconButton(
-            icon: Icon(Icons.skip_next, color: _C.teal),
-            onPressed: pro.nextTrack,
+
+        // Now Playing
+        if (pro.currentPlaylist.isNotEmpty && pro.isMusicPlaying)
+          Container(
+            padding: const EdgeInsets.all(8),
+            child: Column(
+              children: [
+                Text(
+                  'NOW PLAYING',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: _C.teal,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text(
+                  pro.currentTrack,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: _C.darkText,
+                  ),
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+
+        // Music List or Loading
+        Expanded(
+          child: pro.isLoadingServerMusic && pro.musicTabIndex == 0
+              ? const Center(
+                  child: CircularProgressIndicator(
+                    valueColor: AlwaysStoppedAnimation<Color>(_C.teal),
+                  ),
+                )
+              : _buildMusicList(pro, context),
+        ),
+
+        // Playback Controls
+        if (pro.currentPlaylist.isNotEmpty)
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              IconButton(
+                icon: Icon(Icons.skip_previous, color: _C.teal),
+                onPressed: pro.prevTrack,
+              ),
+              CircleAvatar(
+                backgroundColor: _C.teal,
+                child: IconButton(
+                  icon: Icon(
+                    pro.isMusicPlaying ? Icons.pause : Icons.play_arrow,
+                    color: Colors.white,
+                  ),
+                  onPressed: pro.togglePlayPause,
+                ),
+              ),
+              IconButton(
+                icon: Icon(Icons.skip_next, color: _C.teal),
+                onPressed: pro.nextTrack,
+              ),
+              IconButton(
+                icon: Icon(Icons.stop, color: Colors.red),
+                onPressed: pro.stopMusic,
+              ),
+            ],
+          ),
+
+        // Close Button
+        TextButton(
+          onPressed: pro.toggleMusicFlip,
+          child: const Text(
+            'CLOSE PLAYER',
+            style: TextStyle(color: Colors.white),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMusicList(ORSystemProvider pro, BuildContext context) {
+    final playlist = pro.currentPlaylist;
+
+    if (playlist.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.music_off, color: Colors.white54, size: 40),
+            const SizedBox(height: 8),
+            Text(
+              pro.musicTabIndex == 0 ? 'No server music' : 'No default music',
+              style: TextStyle(color: Colors.white54),
+            ),
+            if (pro.musicTabIndex == 0) ...[
+              const SizedBox(height: 8),
+              ElevatedButton.icon(
+                onPressed: () => _showUploadDialog(context, pro),
+                icon: const Icon(Icons.upload, size: 16),
+                label: const Text('Upload Music'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _C.teal,
+                  foregroundColor: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: () => pro.fetchServerMusic(),
+                child: const Text('Refresh', style: TextStyle(color: _C.teal)),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      itemCount: playlist.length,
+      itemBuilder: (context, index) {
+        final track = playlist[index];
+        final isCurrent = pro.currentTrackIndex == index;
+
+        return Container(
+          margin: const EdgeInsets.only(bottom: 4),
+          decoration: BoxDecoration(
+            color: isCurrent
+                ? _C.teal.withOpacity(0.2)
+                : Colors.white.withOpacity(0.05),
+            borderRadius: BorderRadius.circular(8),
+            border: isCurrent ? Border.all(color: _C.teal, width: 1) : null,
+          ),
+          child: ListTile(
+            dense: true,
+            leading: Icon(
+              Icons.music_note,
+              color: isCurrent ? _C.teal : Colors.white54,
+              size: 20,
+            ),
+            title: Text(
+              track['title'] ?? track['name'] ?? 'Unknown',
+              style: TextStyle(
+                color: isCurrent ? _C.teal : Colors.white,
+                fontSize: 12,
+                fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            trailing: pro.musicTabIndex == 0
+                ? IconButton(
+                    icon: const Icon(
+                      Icons.delete_outline,
+                      color: Colors.red,
+                      size: 18,
+                    ),
+                    onPressed: () => _confirmDelete(context, pro, track),
+                  )
+                : null,
+            onTap: () => pro.playTrackAtIndex(index),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _confirmDelete(
+    BuildContext context,
+    ORSystemProvider pro,
+    Map<String, dynamic> track,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Delete Music'),
+        content: Text('Delete "${track['title'] ?? track['name']}"?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Delete'),
           ),
         ],
       ),
-      TextButton(
-        onPressed: pro.toggleMusicFlip,
-        child: const Text(
-          'CLOSE PLAYER',
-          style: TextStyle(color: Colors.white),
+    );
+
+    if (confirmed == true) {
+      await pro.deleteServerMusic(track['id']);
+    }
+  }
+
+  Future<void> _showUploadDialog(
+    BuildContext context,
+    ORSystemProvider pro,
+  ) async {
+    await pro.uploadMusic();
+  }
+}
+
+class _MusicTabButton extends StatelessWidget {
+  final String title;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  const _MusicTabButton({
+    required this.title,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: isSelected ? _C.teal.withOpacity(0.3) : Colors.transparent,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Text(
+            title,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: isSelected ? _C.teal : Colors.white70,
+              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+              fontSize: 12,
+            ),
+          ),
         ),
       ),
-    ],
-  );
+    );
+  }
 }
 
 // ─── Footer ───────────────────────────────────────────────────────────────────

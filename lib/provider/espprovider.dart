@@ -175,8 +175,16 @@ class ESP32Provider with ChangeNotifier {
 
   Future<void> _loadIP() async {
     final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString(_K.prefEsp32Ip) ?? '';
-    if (saved.isNotEmpty) _esp32IP = saved;
+    final saved = prefs.getString("esp32_ip") ?? '';
+    print("Saved IP: $saved");
+
+    if (saved.isNotEmpty) {
+      // Add port here
+      _esp32IP = "$saved:8080";
+      print("kskkskskksksks$_esp32IP");
+    } else {
+      print('No saved IP found, using default: $_esp32IP');
+    }
   }
 
   /// Public init kept for backward compatibility.
